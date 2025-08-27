@@ -46,7 +46,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         topbar = QtWidgets.QHBoxLayout()
         self.btn_capture = QtWidgets.QPushButton("Capture Rect ROI → Active")
-        self.btn_capture_poly = QtWidgets.QPushButton("Capture Poly ROI → Active")  # NEW
+        self.btn_capture_poly = QtWidgets.QPushButton("Capture Poly ROI → Active")
         self.btn_clear   = QtWidgets.QPushButton("Clear Active")
         self.btn_rotate  = QtWidgets.QPushButton("Rotate 90° view")
         self.chk_flip_h  = QtWidgets.QCheckBox("Flip H")
@@ -88,9 +88,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_every = QtWidgets.QSpinBox(); self.sp_every.setRange(1, 5); self.sp_every.setValue(1)
         self.chk_clahe = QtWidgets.QCheckBox("CLAHE + Blur"); self.chk_clahe.setChecked(True)
 
+        # NEW: Detection mode (Color-aware vs Grayscale-only)
+        self.cmb_mode = QtWidgets.QComboBox()
+        self.cmb_mode.addItems(["Color + geometry", "Grayscale (geometry only)"])
+        self.cmb_mode.setCurrentIndex(0)
+
         proc_form.addRow("Process width", self.cmb_proc_w)
         proc_form.addRow("Process every Nth frame", self.sp_every)
         proc_form.addRow(self.chk_clahe)
+        proc_form.addRow("Detection mode", self.cmb_mode)  # NEW row
         right.addWidget(proc_box)
 
         # Templates manager
@@ -130,18 +136,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- Signals ----
         self.btn_capture.clicked.connect(lambda: self.video.enable_rect_selection(True))
-        self.btn_capture_poly.clicked.connect(lambda: self.video.enable_polygon_selection(True))  # NEW
+        self.btn_capture_poly.clicked.connect(lambda: self.video.enable_polygon_selection(True))
         self.btn_clear.clicked.connect(self._on_clear_active)
         self.btn_rotate.clicked.connect(self._on_rotate)
 
         self.video.roiSelected.connect(self._on_rect_selected)
-        self.video.polygonSelected.connect(self._on_poly_selected)  # NEW
+        self.video.polygonSelected.connect(self._on_poly_selected)
 
         self.cmb_slot.currentIndexChanged.connect(self._on_slot_changed)
         self.chk_publish.toggled.connect(self._on_publish_toggle)
         self.chk_clahe.toggled.connect(self._on_clahe_toggle)
         self.sp_maxinst.valueChanged.connect(self._on_maxinst_changed)
         self.chk_enable.toggled.connect(self._on_enable_toggle)
+        self.cmb_mode.currentIndexChanged.connect(self._on_mode_changed)  # NEW
 
         # ---- Timer/State ----
         self.rot_quadrant = 0
@@ -158,19 +165,16 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- UI callbacks ----
     def _on_slot_changed(self, idx: int):
         self.active_slot = int(idx)
-        # update defaults in the editor (soft)
         self.ed_name.setText(self.ed_name.text() or f"Obj{self.active_slot+1}")
 
     def _on_publish_toggle(self, ok: bool):
         self.publish_enabled = bool(ok)
-        # reconfigure socket with current values
         try:
             self.publisher.configure(self.ed_ip.text().strip(), int(self.sp_port.value()))
         except Exception:
             pass
 
     def _on_clahe_toggle(self, ok: bool):
-        # apply to all existing matchers
         for s in self.multi.slots:
             s.matcher.set_use_clahe(bool(ok))
 
@@ -179,6 +183,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_enable_toggle(self, ok: bool):
         self.multi.set_enabled(self.active_slot, bool(ok))
+
+    def _on_mode_changed(self, idx: int):
+        """0 -> Color + geometry, 1 -> Grayscale only."""
+        use_color = (idx == 0)
+        for s in self.multi.slots:
+            s.matcher.update_params(use_color_gate=use_color)
 
     def _on_clear_active(self):
         self.multi.clear(self.active_slot)
@@ -211,8 +221,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- ROI capture (polygon) ----
     def _on_poly_selected(self, qpoints: List[QtCore.QPoint]):
-        """qpoints are in label coordinates; map them to processed-frame coords,
-        crop to polygon bbox, and build a mask for non-rectangular template."""
+        """Map label points to processed-frame space, crop bbox, rasterize mask, set polygon template."""
         if self.last_frame_bgr is None or not qpoints:
             return
 
@@ -222,12 +231,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if draw.isNull():
             return
 
-        # Map label points -> processed-frame space
         sx = fw / float(draw.width()); sy = fh / float(draw.height())
         pts_img = []
         for p in qpoints:
             if not draw.contains(p):
-                # clamp into draw rect to be safe
                 px = min(max(p.x(), draw.left()), draw.right())
                 py = min(max(p.y(), draw.top()), draw.bottom())
                 p = QtCore.QPoint(px, py)
@@ -236,25 +243,20 @@ class MainWindow(QtWidgets.QMainWindow):
             pts_img.append([xi, yi])
 
         pts_np = np.array(pts_img, dtype=np.float32)
-
-        # Compute tight bbox (clip to frame)
         x1 = max(0, int(np.floor(np.min(pts_np[:, 0]))))
         y1 = max(0, int(np.floor(np.min(pts_np[:, 1]))))
         x2 = min(fw, int(np.ceil(np.max(pts_np[:, 0]))))
         y2 = min(fh, int(np.ceil(np.max(pts_np[:, 1]))))
-        w = max(0, x2 - x1)
-        h = max(0, y2 - y1)
+        w = max(0, x2 - x1); h = max(0, y2 - y1)
         if w < 10 or h < 10:
             QtWidgets.QMessageBox.warning(self, "ROI too small", "Please select a larger polygon.")
             return
 
-        # Shift polygon to bbox space and rasterize mask
         pts_shift = (pts_np - np.array([[x1, y1]], dtype=np.float32)).astype(np.int32).reshape(-1, 1, 2)
         mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(mask, [pts_shift], 255)
 
         roi = frame[y1:y2, x1:x2].copy()
-        # sanity check
         if roi.shape[:2] != mask.shape[:2]:
             QtWidgets.QMessageBox.warning(self, "Mask mismatch", "Internal error building polygon mask.")
             return
@@ -301,7 +303,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Frame skip
         self.frame_count += 1
         if (self.frame_count % max(1, int(self.sp_every.value()))) != 0:
-            # just display latest processed frame
             disp_rgb = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB)
             qimg = QtGui.QImage(disp_rgb.data, disp_rgb.shape[1], disp_rgb.shape[0],
                                 disp_rgb.strides[0], QtGui.QImage.Format_RGB888)
@@ -324,7 +325,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update table
         self._populate_table(objects_report)
 
-        # Publish JSON (industrial-ish schema)
+        # Publish JSON
         if self.publish_enabled:
             payload = self._build_payload(objects_report, proc.shape[1], proc.shape[0], timings={
                 "detect_ms": round(t_det, 1),

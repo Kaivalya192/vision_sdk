@@ -20,12 +20,12 @@ Vision SDK is a Python-based application designed for vision-guided sorting usin
 ### Steps
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Kaivalya192/vision_sdk.git
    cd vision_sdk
    ```
-2. Install the required dependencies:
+2. Install the SDK in editable mode:
    ```bash
-   pip install -r requirements.txt
+   pip install -e .
    ```
 
 ## Usage
@@ -81,4 +81,84 @@ This project is licensed under the MIT License. See the `LICENSE` file for detai
 ## Acknowledgments
 - Built with PyQt5 and OpenCV.
 - Inspired by industrial vision-guided sorting systems.
+
+### JSON Payload Format
+
+The application publishes detection results in the following JSON format:
+
+```json
+{
+  "version": "1.0",
+  "sdk": {
+    "name": "dexsdk",
+    "module": "SIFT",
+    "soft_color_gate": true
+  },
+  "session": {
+    "session_id": "ab12cd34",
+    "frame_id": 1234
+  },
+  "timestamp_ms": 1724730000000,
+  "camera": {
+    "source_index": 0,
+    "proc_width": 640,
+    "proc_height": 360,
+    "coordinate_space": "processed",
+    "units": "pixels"
+  },
+  "result": {
+    "counts": {
+      "objects": 2,
+      "detections": 3
+    },
+    "objects": [
+      {
+        "object_id": 0,
+        "name": "Obj1",
+        "template_size": [180, 120],
+        "detections": [
+          {
+            "instance_id": 0,
+            "score": 0.73,
+            "inliers": 42,
+            "pose": {
+              "x": 245.1,
+              "y": 132.4,
+              "theta_deg": -12.5,
+              "x_scale": 0.98,
+              "y_scale": 1.01
+            },
+            "center": [252.0, 140.5],
+            "quad": [
+              [165.2, 80.1],
+              [330.1, 76.3],
+              [334.4, 196.0],
+              [168.8, 199.2]
+            ],
+            "color": {
+              "bhattacharyya": 0.28,
+              "correlation": 0.42,
+              "deltaE": 22.3
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "timing_ms": {
+    "detect_ms": 7.9,
+    "draw_ms": 1.2,
+    "total_ms": 9.1
+  }
+}
+```
+
+#### Key Fields:
+- **`version`**: Payload version.
+- **`sdk`**: Information about the SDK, including the algorithm used and color gating settings.
+- **`session`**: Identifies the session and frame.
+- **`timestamp_ms`**: Timestamp in Unix epoch milliseconds.
+- **`camera`**: Camera and processed frame details.
+- **`result`**: Detection results, including object counts and detailed information for each detected object.
+- **`timing_ms`**: Timings for various processing stages.
 
