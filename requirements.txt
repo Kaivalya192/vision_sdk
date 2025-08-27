@@ -1,2 +1,4 @@
 numpy
 pyyaml
+pyqt5
+opencv-python

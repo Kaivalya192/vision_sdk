@@ -2,9 +2,9 @@
 # FILE: dexsdk/detection_multi.py
 # ======================================
 """Manage up to 5 templates and aggregate detections for publishing/overlay.
-Adds simple duplicate suppression: only keep instances whose centers are at
-least `min_center_dist_px` apart (per object/template)."""
-
+- Supports rectangular and polygon-masked templates.
+- Simple duplicate suppression via minimum center distance per object.
+"""
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 import cv2, numpy as np
@@ -44,29 +44,39 @@ class MultiTemplateMatcher:
         self.min_center_dist_px = max(0, int(px))
 
     # ---- slot management ----
+    def _ensure_index(self, index: int):
+        """Internal: ensure list has placeholders up to 'index'."""
+        while len(self.slots) <= index:
+            self.slots.append(
+                TemplateSlot(
+                    name=f"Obj{len(self.slots)+1}",
+                    matcher=SIFTMatcher(),
+                    color=PALETTE[len(self.slots) % len(PALETTE)],
+                    enabled=False,
+                )
+            )
+
     def add_or_replace(self, index: int, name: str, roi_bgr: np.ndarray, *, max_instances: int = 3):
-        """Create/replace slot at `index` with a new template ROI."""
+        """Create/replace slot at `index` with a new rectangular template ROI."""
         index = int(index)
         if index < 0 or index >= self.max_slots:
             return
+        self._ensure_index(index)
         m = SIFTMatcher(max_instances=max_instances)
         m.set_template(roi_bgr)
-        color = PALETTE[index % len(PALETTE)]
-        slot = TemplateSlot(name=name, matcher=m, color=color, enabled=True)
-        if index < len(self.slots):
-            self.slots[index] = slot
-        else:
-            # pad with disabled placeholders up to index-1
-            while len(self.slots) < index:
-                self.slots.append(
-                    TemplateSlot(
-                        name=f"Obj{len(self.slots)+1}",
-                        matcher=SIFTMatcher(),
-                        color=PALETTE[len(self.slots) % len(PALETTE)],
-                        enabled=False,
-                    )
-                )
-            self.slots.append(slot)
+        self.slots[index] = TemplateSlot(name=name, matcher=m, color=PALETTE[index % len(PALETTE)], enabled=True)
+
+    def add_or_replace_polygon(self, index: int, name: str, roi_bgr: np.ndarray, roi_mask: np.ndarray, *, max_instances: int = 3):
+        """Create/replace slot at `index` with a polygon-masked template.
+        roi_mask: uint8 (0/255), same size as roi_bgr. Non-zero = keep.
+        """
+        index = int(index)
+        if index < 0 or index >= self.max_slots:
+            return
+        self._ensure_index(index)
+        m = SIFTMatcher(max_instances=max_instances)
+        m.set_template_polygon(roi_bgr, roi_mask)
+        self.slots[index] = TemplateSlot(name=name, matcher=m, color=PALETTE[index % len(PALETTE)], enabled=True)
 
     def clear(self, index: int):
         """Disable and clear template for a slot."""

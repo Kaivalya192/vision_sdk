@@ -1,18 +1,12 @@
 # ==========================
 # FILE: dexsdk/detection.py
 # ==========================
-"""SIFT matcher with RGB-aware (soft) gating + multi-instance detection.
+"""SIFT matcher with RGB-aware (soft) gating + multi-instance + polygon masks.
 
-- Grayscale SIFT + RANSAC for geometry.
-- HSV/LAB color checks are *soft*: accept if colour passes OR geometry is strong.
-- Peel inliers only when a detection is accepted (prevents wiping valid matches).
-
-You can tune via update_params():
-  lowe_ratio, max_matches, min_inliers, ransac_thr_px, min_score,
-  full_affine_fallback, use_clahe,
-  use_color_gate (bool), color_gate_bhat (float), color_gate_corr (float),
-  color_gate_lab (float), soft_inlier_boost (int), soft_score_boost (float),
-  max_instances (int)
+New:
+- set_template_polygon(roi_bgr, roi_mask) to set a non-rectangular template.
+- Masked SIFT detectAndCompute + masked HSV/LAB color gating.
+- Warps the template mask and uses it while comparing color for gating.
 """
 from typing import Optional, Tuple, Dict, List
 import cv2, numpy as np
@@ -36,8 +30,9 @@ def _make_sift():
     return cv2.SIFT_create()
 
 
-def _kpdesc(detector, gray: np.ndarray):
-    return detector.detectAndCompute(gray, None)
+def _kpdesc(detector, gray: np.ndarray, mask: Optional[np.ndarray] = None):
+    # mask: uint8 0/255, same size as gray
+    return detector.detectAndCompute(gray, mask)
 
 
 def _ratio_match_L2(des1, des2, ratio: float, crosscheck_if_empty: bool = True) -> List[cv2.DMatch]:
@@ -49,8 +44,7 @@ def _ratio_match_L2(des1, des2, ratio: float, crosscheck_if_empty: bool = True) 
     knn = bf.knnMatch(des1, des2, k=2)
     good: List[cv2.DMatch] = []
     for pair in knn:
-        if len(pair) < 2:
-            continue
+        if len(pair) < 2: continue
         m, n = pair
         if m.distance < ratio * n.distance:
             good.append(m)
@@ -59,24 +53,34 @@ def _ratio_match_L2(des1, des2, ratio: float, crosscheck_if_empty: bool = True) 
     return good
 
 
-def _hsv_hist_masked(bgr: np.ndarray):
+def _hsv_hist_masked(bgr: np.ndarray, mask: Optional[np.ndarray] = None):
     """Return normalized 2D HSV hist (H,S) with low-S/V masked out + valid ratio."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # mask out very desaturated or dark pixels
-    mask = cv2.inRange(hsv, (0, 32, 32), (180, 255, 255))
-    valid = int(cv2.countNonZero(mask))
-    hist = cv2.calcHist([hsv], [0, 1], mask, [30, 32], [0, 180, 0, 256])
+    # sat/val validity
+    sv_mask = cv2.inRange(hsv, (0, 32, 32), (180, 255, 255))
+    if mask is not None:
+        # ensure binary
+        m = (mask > 0).astype(np.uint8) * 255
+        final_mask = cv2.bitwise_and(sv_mask, m)
+    else:
+        final_mask = sv_mask
+    valid = int(cv2.countNonZero(final_mask))
+    hist = cv2.calcHist([hsv], [0, 1], final_mask, [30, 32], [0, 180, 0, 256])
     cv2.normalize(hist, hist)
     total = bgr.shape[0] * bgr.shape[1]
     valid_ratio = (valid / max(1, total))
     return hist, valid_ratio
 
 
-def _lab_mean_deltaE(bgr_a: np.ndarray, bgr_b: np.ndarray) -> float:
-    """Mean CIE76 ΔE between two same-sized images."""
+def _lab_mean_deltaE(bgr_a: np.ndarray, bgr_b: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+    """Mean CIE76 ΔE; if mask provided, average over mask>0 region only."""
     lab_a = cv2.cvtColor(bgr_a, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_b = cv2.cvtColor(bgr_b, cv2.COLOR_BGR2LAB).astype(np.float32)
     dE = np.linalg.norm(lab_a - lab_b, axis=2)
+    if mask is not None:
+        m = (mask > 0)
+        if m.any():
+            return float(dE[m].mean())
     return float(np.mean(dE))
 
 
@@ -93,11 +97,11 @@ class SIFTMatcher:
         use_clahe: bool = True,
         # Color-gate (soft) defaults
         use_color_gate: bool = True,
-        color_gate_bhat: float = 0.70,   # accept if Bhattacharyya <= 0.70
-        color_gate_corr: float = 0.10,   # OR correlation >= 0.10
-        color_gate_lab: float  = 35.0,   # OR mean ΔE(LAB) <= 35
-        soft_inlier_boost: int = 3,      # allow miss if ninliers ≥ min_inliers + 3
-        soft_score_boost: float = 0.05,  # and score ≥ min_score + 0.05
+        color_gate_bhat: float = 0.70,
+        color_gate_corr: float = 0.10,
+        color_gate_lab: float  = 35.0,
+        soft_inlier_boost: int = 3,
+        soft_score_boost: float = 0.05,
         max_instances: int = 2,
     ):
         self.sift = _make_sift()
@@ -119,6 +123,7 @@ class SIFTMatcher:
         )
         # Template cache
         self.template_bgr: Optional[np.ndarray] = None
+        self.tpl_mask: Optional[np.ndarray] = None      # uint8 0/255, same size as template
         self.tpl_gray: Optional[np.ndarray] = None
         self.tpl_kp = None
         self.tpl_des = None
@@ -135,21 +140,29 @@ class SIFTMatcher:
     def update_params(self, **kwargs):
         for k, v in kwargs.items():
             if k in self.params:
-                if isinstance(self.params[k], bool):
-                    self.params[k] = bool(v)
-                elif isinstance(self.params[k], int):
-                    self.params[k] = int(v)
-                else:
-                    self.params[k] = float(v)
+                if isinstance(self.params[k], bool): self.params[k] = bool(v)
+                elif isinstance(self.params[k], int): self.params[k] = int(v)
+                else: self.params[k] = float(v)
 
     def set_template(self, roi_bgr: np.ndarray):
+        """Rectangular template (no mask)."""
         self.template_bgr = roi_bgr.copy()
+        self.tpl_mask = None
+        self._recompute_template()
+
+    def set_template_polygon(self, roi_bgr: np.ndarray, roi_mask: np.ndarray):
+        """Non-rectangular template with mask (uint8 0/255)."""
+        self.template_bgr = roi_bgr.copy()
+        m = roi_mask
+        if m.dtype != np.uint8: m = m.astype(np.uint8)
+        if m.ndim == 3: m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+        self.tpl_mask = (m > 0).astype(np.uint8) * 255
         self._recompute_template()
 
     def clear_template(self):
         self.template_bgr = None
+        self.tpl_mask = None
         self.tpl_gray = None
-        thelp = None
         self.tpl_kp = None
         self.tpl_des = None
         self.tpl_size = None
@@ -163,24 +176,14 @@ class SIFTMatcher:
         overlay = scene_bgr.copy()
         pose_first: Optional[dict] = None
 
-        # Template
         if self.tpl_kp is None or self.tpl_des is None or len(self.tpl_kp) < 4:
-            return (
-                None,
-                overlay,
-                {"fail_stage": "no_template", "tpl_kp": 0, "scene_kp": 0, "matches": 0, "inliers": 0, "instances": 0, "poses": []},
-            )
+            return (None, overlay, {"fail_stage": "no_template", "tpl_kp": 0, "scene_kp": 0, "matches": 0, "inliers": 0, "instances": 0, "poses": []})
 
-        # Scene features
         scene_gray = _prep_gray(scene_bgr, use_clahe=self.use_clahe)
-        kp2, des2 = _kpdesc(self.sift, scene_gray)
+        kp2, des2 = _kpdesc(self.sift, scene_gray, None)
         if des2 is None or len(kp2) < 4:
-            return None, overlay, {
-                "fail_stage": "scene_few_kp",
-                "tpl_kp": len(self.tpl_kp), "scene_kp": 0, "matches": 0, "inliers": 0, "instances": 0, "poses": []
-            }
+            return (None, overlay, {"fail_stage": "scene_few_kp", "tpl_kp": len(self.tpl_kp), "scene_kp": 0, "matches": 0, "inliers": 0, "instances": 0, "poses": []})
 
-        # Matches (keep extra for multi-instance)
         good = _ratio_match_L2(self.tpl_des, des2, ratio=float(self.params["lowe_ratio"]))
         good = sorted(good, key=lambda m: m.distance)[: int(self.params["max_matches"]) * max(1, int(self.params["max_instances"]))]
 
@@ -190,7 +193,6 @@ class SIFTMatcher:
             db["fail_stage"] = "few_matches"
             return None, overlay, db
 
-        # Arrays + active pool
         tpl_pts_all = np.float32([self.tpl_kp[m.queryIdx].pt for m in good])
         scn_pts_all = np.float32([kp2[m.trainIdx].pt for m in good])
         active_idx = np.arange(len(good))
@@ -199,8 +201,7 @@ class SIFTMatcher:
         max_inst = max(1, int(self.params["max_instances"]))
 
         for _ in range(max_inst):
-            if active_idx.size < 4:
-                break
+            if active_idx.size < 4: break
             pts1 = tpl_pts_all[active_idx]
             pts2 = scn_pts_all[active_idx]
 
@@ -215,66 +216,53 @@ class SIFTMatcher:
                     ransacReprojThreshold=float(self.params["ransac_thr_px"]),
                     maxIters=4000, confidence=0.995, refineIters=10
                 )
-            if M is None or inliers is None:
-                break
+            if M is None or inliers is None: break
 
             inl_mask = inliers.ravel().astype(bool)
             ninl = int(inl_mask.sum())
             score = float(ninl / max(1, active_idx.size))
             geom_ok = (ninl >= int(self.params["min_inliers"])) and (score >= float(self.params["min_score"]))
 
-            # ---- Color checks (soft) ----
             color_ok = True
             color_bhat = color_corr = color_dE = -1.0
             if geom_ok and bool(self.params["use_color_gate"]) and self.tpl_hist is not None and self.tpl_size is not None:
                 w, h = self.tpl_size
-                warped = cv2.warpAffine(
-                    scene_bgr, M, (w, h),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_REFLECT
-                )
-                hist2, valid_ratio = _hsv_hist_masked(warped)
-
-                # If too few valid colored pixels in warped ROI, skip color gating
+                warped = cv2.warpAffine(scene_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                warped_mask = None
+                if self.tpl_mask is not None:
+                    warped_mask = cv2.warpAffine(self.tpl_mask, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                hist2, valid_ratio = _hsv_hist_masked(warped, warped_mask)
                 if valid_ratio >= 0.10 and self.tpl_hist_valid_ratio >= 0.10:
                     color_bhat = float(cv2.compareHist(self.tpl_hist, hist2, cv2.HISTCMP_BHATTACHARYYA))
                     color_corr = float(cv2.compareHist(self.tpl_hist, hist2, cv2.HISTCMP_CORREL))
-                    color_dE = _lab_mean_deltaE(self.template_bgr, warped)
-
+                    color_dE = _lab_mean_deltaE(self.template_bgr, warped, warped_mask)
                     bhat_ok = (color_bhat <= float(self.params["color_gate_bhat"]))
                     corr_ok = (color_corr >= float(self.params["color_gate_corr"]))
                     dE_ok   = (color_dE  <= float(self.params["color_gate_lab"]))
                     color_ok = bhat_ok or corr_ok or dE_ok
-
-                    # Soft fallback: strong geometry can override mild color miss
                     if not color_ok:
                         if (ninl >= int(self.params["min_inliers"]) + int(self.params["soft_inlier_boost"])) and \
                            (score >= float(self.params["min_score"]) + float(self.params["soft_score_boost"])):
-                            color_ok = True  # soft accept
+                            color_ok = True
 
             accept = geom_ok and color_ok
-
             if accept:
                 a, b, tx = M[0]; c, d, ty = M[1]
-                if np.isfinite(M).all() and (a * d - b * c) > 1e-6:
+                if np.isfinite(M).all() and (a*d - b*c) > 1e-6:
                     theta = -np.degrees(np.arctan2(c, a))
                     x_scale = float(np.hypot(a, c))
                     y_scale = float(np.hypot(b, d))
-
-                    # quad + center
                     wq, hq = self.tpl_size if self.tpl_size is not None else (0, 0)
-                    quad = None; center = None
+                    quad, center = None, None
                     if self.tpl_size is not None:
-                        corners = np.float32([[0, 0], [wq, 0], [wq, hq], [0, hq]])
-                        quad_m = np.hstack([corners, np.ones((4, 1), np.float32)]) @ M.T
+                        corners = np.float32([[0,0],[wq,0],[wq,hq],[0,hq]])
+                        quad_m = np.hstack([corners, np.ones((4,1), np.float32)]) @ M.T
                         if np.isfinite(quad_m).all():
                             quad = quad_m.astype(float).tolist()
-                            cxy = quad_m.mean(axis=0)
-                            center = [float(cxy[0]), float(cxy[1])]
+                            cxy = quad_m.mean(axis=0); center = [float(cxy[0]), float(cxy[1])]
                             if draw:
-                                cv2.polylines(overlay, [quad_m.astype(np.int32)], True, (0, 255, 0), 2)
-                                cv2.circle(overlay, (int(center[0]), int(center[1])), 5, (0, 255, 0), -1)
-
+                                cv2.polylines(overlay, [quad_m.astype(np.int32)], True, (0,255,0), 2)
+                                cv2.circle(overlay, (int(center[0]), int(center[1])), 5, (0,255,0), -1)
                     det = dict(
                         x=float(tx), y=float(ty), theta=float(theta),
                         x_scale=x_scale, y_scale=y_scale, score=score, ninliers=ninl,
@@ -282,13 +270,10 @@ class SIFTMatcher:
                         quad=quad, center=center,
                     )
                     detections.append(det)
-
-                    # Peel ONLY when accepted
-                    active_idx = active_idx[~inl_mask]
+                    active_idx = active_idx[~inl_mask]  # peel only on accept
                 else:
                     break
             else:
-                # Do not peel on rejection; stop trying further to avoid loops.
                 break
 
         if not detections:
@@ -296,22 +281,15 @@ class SIFTMatcher:
             db["fail_stage"] = "no_detection"
             return None, overlay, db
 
-        # Best first
         detections_sorted = sorted(detections, key=lambda d: (d["ninliers"], d["score"]), reverse=True)
         pose_first = {k: detections_sorted[0][k] for k in ["x", "y", "theta", "x_scale", "y_scale", "score"]}
-
-        debug_out = {
-            **dbg_base,
-            "inliers": detections_sorted[0]["ninliers"],
-            "instances": len(detections_sorted),
-            "poses": detections_sorted,
-            "fail_stage": "—",
-        }
+        debug_out = {**dbg_base, "inliers": detections_sorted[0]["ninliers"], "instances": len(detections_sorted), "poses": detections_sorted, "fail_stage": "—"}
         return pose_first, overlay, debug_out
 
     # ---- internals ----
     def _recompute_template(self):
         if self.template_bgr is None:
+            self.tpl_mask = None
             self.tpl_gray = None
             self.tpl_kp = None
             self.tpl_des = None
@@ -320,6 +298,8 @@ class SIFTMatcher:
             self.tpl_hist_valid_ratio = 1.0
             return
         self.tpl_gray = _prep_gray(self.template_bgr, use_clahe=self.use_clahe)
-        self.tpl_kp, self.tpl_des = _kpdesc(self.sift, self.tpl_gray)
+        # SIFT with optional mask
+        self.tpl_kp, self.tpl_des = _kpdesc(self.sift, self.tpl_gray, self.tpl_mask)
         self.tpl_size = (self.template_bgr.shape[1], self.template_bgr.shape[0])
-        self.tpl_hist, self.tpl_hist_valid_ratio = _hsv_hist_masked(self.template_bgr)
+        # color model (masked)
+        self.tpl_hist, self.tpl_hist_valid_ratio = _hsv_hist_masked(self.template_bgr, self.tpl_mask)

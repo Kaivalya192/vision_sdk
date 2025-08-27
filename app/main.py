@@ -45,12 +45,13 @@ class MainWindow(QtWidgets.QMainWindow):
         left.setSpacing(8)
 
         topbar = QtWidgets.QHBoxLayout()
-        self.btn_capture = QtWidgets.QPushButton("Capture ROI → Active")
+        self.btn_capture = QtWidgets.QPushButton("Capture Rect ROI → Active")
+        self.btn_capture_poly = QtWidgets.QPushButton("Capture Poly ROI → Active")  # NEW
         self.btn_clear   = QtWidgets.QPushButton("Clear Active")
         self.btn_rotate  = QtWidgets.QPushButton("Rotate 90° view")
         self.chk_flip_h  = QtWidgets.QCheckBox("Flip H")
         self.chk_flip_v  = QtWidgets.QCheckBox("Flip V")
-        for w in (self.btn_capture, self.btn_clear, self.btn_rotate, self.chk_flip_h, self.chk_flip_v):
+        for w in (self.btn_capture, self.btn_capture_poly, self.btn_clear, self.btn_rotate, self.chk_flip_h, self.chk_flip_v):
             topbar.addWidget(w); topbar.addSpacing(6)
         topbar.addStretch(1)
         left.addLayout(topbar)
@@ -102,8 +103,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sp_maxinst = QtWidgets.QSpinBox(); self.sp_maxinst.setRange(1, 10); self.sp_maxinst.setValue(3)
         self.chk_enable = QtWidgets.QCheckBox("Enabled"); self.chk_enable.setChecked(True)
         row1.addWidget(QtWidgets.QLabel("Active:")); row1.addWidget(self.cmb_slot)
-        row1.addWidget(self.ed_name)
-        self.multi.set_min_center_dist(60)
+        row1.addWidget(QtWidgets.QLabel("Name:")); row1.addWidget(self.ed_name)
         row1.addWidget(QtWidgets.QLabel("Max Inst:")); row1.addWidget(self.sp_maxinst)
         row1.addWidget(self.chk_enable)
         tmpl_v.addLayout(row1)
@@ -129,10 +129,13 @@ class MainWindow(QtWidgets.QMainWindow):
         root.addLayout(right, 1)
 
         # ---- Signals ----
-        self.btn_capture.clicked.connect(lambda: self.video.enable_selection(True))
+        self.btn_capture.clicked.connect(lambda: self.video.enable_rect_selection(True))
+        self.btn_capture_poly.clicked.connect(lambda: self.video.enable_polygon_selection(True))  # NEW
         self.btn_clear.clicked.connect(self._on_clear_active)
         self.btn_rotate.clicked.connect(self._on_rotate)
-        self.video.roiSelected.connect(self._on_roi_selected)
+
+        self.video.roiSelected.connect(self._on_rect_selected)
+        self.video.polygonSelected.connect(self._on_poly_selected)  # NEW
 
         self.cmb_slot.currentIndexChanged.connect(self._on_slot_changed)
         self.chk_publish.toggled.connect(self._on_publish_toggle)
@@ -183,10 +186,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_rotate(self):
         self.rot_quadrant = (self.rot_quadrant + 1) % 4
 
-    def _on_roi_selected(self, rect: QtCore.QRect):
+    # ---- ROI capture (rect) ----
+    def _on_rect_selected(self, rect: QtCore.QRect):
         if self.last_frame_bgr is None:
             return
-        frame = self._proc_frame_copy()
+        frame = self._proc_frame_copy()  # downscaled
         fh, fw = frame.shape[:2]
         draw = self.video._last_draw_rect
         if draw.isNull():
@@ -202,9 +206,61 @@ class MainWindow(QtWidgets.QMainWindow):
         if roi.size == 0 or roi.shape[0] < 10 or roi.shape[1] < 10:
             QtWidgets.QMessageBox.warning(self, "ROI too small", "Please select a larger area.")
             return
-
         name = self.ed_name.text().strip() or f"Obj{self.active_slot+1}"
         self.multi.add_or_replace(self.active_slot, name, roi_bgr=roi, max_instances=int(self.sp_maxinst.value()))
+
+    # ---- ROI capture (polygon) ----
+    def _on_poly_selected(self, qpoints: List[QtCore.QPoint]):
+        """qpoints are in label coordinates; map them to processed-frame coords,
+        crop to polygon bbox, and build a mask for non-rectangular template."""
+        if self.last_frame_bgr is None or not qpoints:
+            return
+
+        frame = self._proc_frame_copy()  # downscaled (processed space)
+        fh, fw = frame.shape[:2]
+        draw = self.video._last_draw_rect
+        if draw.isNull():
+            return
+
+        # Map label points -> processed-frame space
+        sx = fw / float(draw.width()); sy = fh / float(draw.height())
+        pts_img = []
+        for p in qpoints:
+            if not draw.contains(p):
+                # clamp into draw rect to be safe
+                px = min(max(p.x(), draw.left()), draw.right())
+                py = min(max(p.y(), draw.top()), draw.bottom())
+                p = QtCore.QPoint(px, py)
+            xi = (p.x() - draw.x()) * sx
+            yi = (p.y() - draw.y()) * sy
+            pts_img.append([xi, yi])
+
+        pts_np = np.array(pts_img, dtype=np.float32)
+
+        # Compute tight bbox (clip to frame)
+        x1 = max(0, int(np.floor(np.min(pts_np[:, 0]))))
+        y1 = max(0, int(np.floor(np.min(pts_np[:, 1]))))
+        x2 = min(fw, int(np.ceil(np.max(pts_np[:, 0]))))
+        y2 = min(fh, int(np.ceil(np.max(pts_np[:, 1]))))
+        w = max(0, x2 - x1)
+        h = max(0, y2 - y1)
+        if w < 10 or h < 10:
+            QtWidgets.QMessageBox.warning(self, "ROI too small", "Please select a larger polygon.")
+            return
+
+        # Shift polygon to bbox space and rasterize mask
+        pts_shift = (pts_np - np.array([[x1, y1]], dtype=np.float32)).astype(np.int32).reshape(-1, 1, 2)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts_shift], 255)
+
+        roi = frame[y1:y2, x1:x2].copy()
+        # sanity check
+        if roi.shape[:2] != mask.shape[:2]:
+            QtWidgets.QMessageBox.warning(self, "Mask mismatch", "Internal error building polygon mask.")
+            return
+
+        name = self.ed_name.text().strip() or f"Obj{self.active_slot+1}"
+        self.multi.add_or_replace_polygon(self.active_slot, name, roi_bgr=roi, roi_mask=mask, max_instances=int(self.sp_maxinst.value()))
 
     # ---- Processing helpers ----
     def _grab(self):
@@ -273,7 +329,6 @@ class MainWindow(QtWidgets.QMainWindow):
             payload = self._build_payload(objects_report, proc.shape[1], proc.shape[0], timings={
                 "detect_ms": round(t_det, 1),
                 "draw_ms": round(t_draw, 1),
-                # total computed below
             })
             self.publisher.send(payload)
 
@@ -333,7 +388,6 @@ class MainWindow(QtWidgets.QMainWindow):
             },
             "timing_ms": {
                 **timings,
-                # total is sum of components we track in-app this loop
                 "total_ms": round(sum(timings.values()), 1)
             }
         }
