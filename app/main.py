@@ -27,11 +27,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Publisher
         self.publisher = UDPPublisher()
-        self.publish_enabled = False
+        self.publish_enabled = False  # UI checkbox (still respected in Trigger mode)
 
         # Multi-template (max 5 objects)
         self.multi = MultiTemplateMatcher(max_slots=5, min_center_dist_px=40)
         self.active_slot = 0  # which slot ROI capture goes to
+
+        # Modes
+        self.mode: str = "training"  # "training" or "trigger"
+        self._last_overlay: Optional[np.ndarray] = None
+        self._overlay_until: float = 0.0  # epoch seconds; show overlay until this time in Trigger mode
 
         # ---- Layout ----
         central = QtWidgets.QWidget()
@@ -66,6 +71,20 @@ class MainWindow(QtWidgets.QMainWindow):
         right = QtWidgets.QVBoxLayout()
         right.setSpacing(10)
 
+        # Mode card (NEW)
+        mode_box = QtWidgets.QGroupBox("Mode")
+        mode_h = QtWidgets.QHBoxLayout(mode_box)
+        self.rad_training = QtWidgets.QRadioButton("Training")
+        self.rad_trigger  = QtWidgets.QRadioButton("Trigger")
+        self.rad_training.setChecked(True)
+        self.btn_trigger = QtWidgets.QPushButton("TRIGGER Detect + Publish")
+        self.btn_trigger.setEnabled(False)  # only in Trigger mode
+        mode_h.addWidget(self.rad_training)
+        mode_h.addWidget(self.rad_trigger)
+        mode_h.addStretch(1)
+        mode_h.addWidget(self.btn_trigger)
+        right.addWidget(mode_box)
+
         # Publisher card
         net_box = QtWidgets.QGroupBox("Publisher")
         net_form = QtWidgets.QFormLayout(net_box)
@@ -84,19 +103,16 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in [320, 480, 640, 800, 960, 1280]:
             self.cmb_proc_w.addItem(str(w))
         self.cmb_proc_w.setCurrentText("640")
-
         self.sp_every = QtWidgets.QSpinBox(); self.sp_every.setRange(1, 5); self.sp_every.setValue(1)
         self.chk_clahe = QtWidgets.QCheckBox("CLAHE + Blur"); self.chk_clahe.setChecked(True)
-
-        # NEW: Detection mode (Color-aware vs Grayscale-only)
+        # Detection mode (Color-aware vs Grayscale-only)
         self.cmb_mode = QtWidgets.QComboBox()
         self.cmb_mode.addItems(["Color + geometry", "Grayscale (geometry only)"])
         self.cmb_mode.setCurrentIndex(0)
-
         proc_form.addRow("Process width", self.cmb_proc_w)
         proc_form.addRow("Process every Nth frame", self.sp_every)
         proc_form.addRow(self.chk_clahe)
-        proc_form.addRow("Detection mode", self.cmb_mode)  # NEW row
+        proc_form.addRow("Detection mode", self.cmb_mode)
         right.addWidget(proc_box)
 
         # Templates manager
@@ -148,14 +164,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_clahe.toggled.connect(self._on_clahe_toggle)
         self.sp_maxinst.valueChanged.connect(self._on_maxinst_changed)
         self.chk_enable.toggled.connect(self._on_enable_toggle)
-        self.cmb_mode.currentIndexChanged.connect(self._on_mode_changed)  # NEW
+        self.cmb_mode.currentIndexChanged.connect(self._on_mode_changed)
+
+        # NEW: mode radios + trigger button
+        self.rad_training.toggled.connect(self._on_mode_radio)
+        self.rad_trigger.toggled.connect(self._on_mode_radio)
+        self.btn_trigger.clicked.connect(self._on_trigger_once)
 
         # ---- Timer/State ----
         self.rot_quadrant = 0
         self.last_frame_bgr: Optional[np.ndarray] = None
         self.frame_count = 0
-        self._fps_t0 = time.perf_counter()
-        self._fps_acc = 0
+        self._fps_acc = 0.0
         self._fps_n = 0
 
         self.timer = QtCore.QTimer(self)
@@ -163,6 +183,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start(0)
 
     # ---- UI callbacks ----
+    def _on_mode_radio(self):
+        self.mode = "training" if self.rad_training.isChecked() else "trigger"
+        self.btn_trigger.setEnabled(self.mode == "trigger")
+        # In training mode, never send JSON automatically, even if checkbox is ON.
+        # (We still keep the checkbox to configure IP/Port.)
+
+    def _on_trigger_once(self):
+        """Run one detection pass and (optionally) publish JSON once."""
+        if self.last_frame_bgr is None:
+            return
+        proc = self._proc_frame_copy()
+        overlay, objects_report, _ = self.multi.compute_all(proc, draw=True)
+
+        # Show overlay for a short time (so user sees the result)
+        self._last_overlay = overlay.copy()
+        self._overlay_until = time.time() + 1.0  # show for ~1s
+
+        # Update table immediately
+        self._populate_table(objects_report)
+
+        # Publish JSON ONLY on trigger (and only if user enabled publish checkbox)
+        if self.publish_enabled:
+            payload = self._build_payload(objects_report, proc.shape[1], proc.shape[0], timings={
+                # single-shot doesn't break timings per stage; send zeros or omit.
+                "detect_ms": 0.0,
+                "draw_ms": 0.0,
+            })
+            self.publisher.send(payload)
+
+    def _on_mode_changed(self, idx: int):
+        """0 -> Color + geometry, 1 -> Grayscale only."""
+        use_color = (idx == 0)
+        for s in self.multi.slots:
+            s.matcher.update_params(use_color_gate=use_color)
+
     def _on_slot_changed(self, idx: int):
         self.active_slot = int(idx)
         self.ed_name.setText(self.ed_name.text() or f"Obj{self.active_slot+1}")
@@ -183,12 +238,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_enable_toggle(self, ok: bool):
         self.multi.set_enabled(self.active_slot, bool(ok))
-
-    def _on_mode_changed(self, idx: int):
-        """0 -> Color + geometry, 1 -> Grayscale only."""
-        use_color = (idx == 0)
-        for s in self.multi.slots:
-            s.matcher.update_params(use_color_gate=use_color)
 
     def _on_clear_active(self):
         self.multi.clear(self.active_slot)
@@ -290,7 +339,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update(self):
         t_all0 = time.perf_counter()
-        # Grab
+        # Grab latest frame
         frame = self._grab()
         if frame is None:
             return
@@ -300,46 +349,44 @@ class MainWindow(QtWidgets.QMainWindow):
         # Preprocess
         proc = self._proc_frame_copy()
 
-        # Frame skip
-        self.frame_count += 1
-        if (self.frame_count % max(1, int(self.sp_every.value()))) != 0:
-            disp_rgb = cv2.cvtColor(proc, cv2.COLOR_BGR2RGB)
-            qimg = QtGui.QImage(disp_rgb.data, disp_rgb.shape[1], disp_rgb.shape[0],
-                                disp_rgb.strides[0], QtGui.QImage.Format_RGB888)
-            self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qimg))
-            return
+        # Mode-dependent behavior
+        if self.mode == "training":
+            # Keep exactly the same live detection UI behavior as before
+            self.frame_count += 1
+            if (self.frame_count % max(1, int(self.sp_every.value()))) == 0:
+                t2 = time.perf_counter()
+                overlay, objects_report, _ = self.multi.compute_all(proc, draw=True)
+                _ = (time.perf_counter() - t2) * 1000.0  # detect_ms (not needed now)
+                disp_bgr = overlay
+                # Update table
+                self._populate_table(objects_report)
+            else:
+                disp_bgr = proc
 
-        # Detect across templates
-        t2 = time.perf_counter()
-        overlay, objects_report, total_instances = self.multi.compute_all(proc, draw=True)
-        t_det = (time.perf_counter() - t2) * 1000.0
+            # IMPORTANT: NEVER publish JSON in training mode, even if checkbox is ON.
+            # (No send here.)
+
+        else:  # Trigger mode
+            # Do not detect continuously. Show plain video unless a recent overlay should be shown.
+            if time.time() < self._overlay_until and self._last_overlay is not None:
+                disp_bgr = self._last_overlay
+            else:
+                disp_bgr = proc
 
         # Display
-        t3 = time.perf_counter()
-        disp_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        disp_rgb = cv2.cvtColor(disp_bgr, cv2.COLOR_BGR2RGB)
         qimg = QtGui.QImage(disp_rgb.data, disp_rgb.shape[1], disp_rgb.shape[0],
                             disp_rgb.strides[0], QtGui.QImage.Format_RGB888)
         self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qimg))
-        t_draw = (time.perf_counter() - t3) * 1000.0
-
-        # Update table
-        self._populate_table(objects_report)
-
-        # Publish JSON
-        if self.publish_enabled:
-            payload = self._build_payload(objects_report, proc.shape[1], proc.shape[0], timings={
-                "detect_ms": round(t_det, 1),
-                "draw_ms": round(t_draw, 1),
-            })
-            self.publisher.send(payload)
 
         # FPS
         dt = time.perf_counter() - t_all0
-        self._fps_acc += 1.0 / max(1e-6, dt)
+        fps = 1.0 / max(1e-6, dt)
+        # simple smoothing over 10 frames
+        self._fps_acc += fps
         self._fps_n += 1
         if self._fps_n >= 10:
-            fps = self._fps_acc / self._fps_n
-            self.lbl_fps.setText(f"FPS: {fps:.1f}")
+            self.lbl_fps.setText(f"FPS: {self._fps_acc / self._fps_n:.1f}")
             self._fps_acc = 0.0
             self._fps_n = 0
 
@@ -373,7 +420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         payload = {
             "version": "1.0",
-            "sdk": {"name": "dexsdk", "module": "SIFT", "soft_color_gate": True},
+            "sdk": {"name": "dexsdk", "module": "SIFT", "soft_color_gate": self.cmb_mode.currentIndex() == 0},
             "session": {"session_id": self.session_id, "frame_id": self.frame_id},
             "timestamp_ms": now_ms,
             "camera": {
