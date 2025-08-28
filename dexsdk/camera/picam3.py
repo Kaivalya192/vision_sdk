@@ -1,3 +1,6 @@
+# ================================
+# FILE: dexsdk/camera/picam3.py
+# ================================
 """
 High-level wrapper for Raspberry Pi Camera Module 3 (IMX708)
 using Picamera2 + libcamera controls.
