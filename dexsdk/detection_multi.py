@@ -138,16 +138,27 @@ class MultiTemplateMatcher:
             # Build report + draw from kept only
             inst_list: List[Dict] = []
             for j, det in enumerate(kept):
+                # ... inside: for j, det in enumerate(kept):
+                ctr = det.get("center")
+                if ctr is not None:
+                    px, py = float(ctr[0]), float(ctr[1])
+                else:
+                    # fallback to origin translation if center missing
+                    px, py = float(det.get("x", 0.0)), float(det.get("y", 0.0))
+
                 inst = {
                     "instance_id": int(j),
                     "score": float(det.get("score", 0.0)),
                     "inliers": int(det.get("ninliers", 0)),
                     "pose": {
-                        "x": float(det.get("x", 0.0)),
-                        "y": float(det.get("y", 0.0)),
+                        # REPORT CENTER here (stable w.r.t rotation)
+                        "x": px,
+                        "y": py,
                         "theta_deg": float(det.get("theta", 0.0)),
                         "x_scale": float(det.get("x_scale", 1.0)),
                         "y_scale": float(det.get("y_scale", 1.0)),
+                        # optional: keep raw origin translation for debugging
+                        "origin_xy": [float(det.get("x", 0.0)), float(det.get("y", 0.0))],
                     },
                     "center": det.get("center", None),
                     "quad": det.get("quad", None),
@@ -157,6 +168,7 @@ class MultiTemplateMatcher:
                         "deltaE": float(det.get("color_deltaE", -1.0)),
                     },
                 }
+
                 inst_list.append(inst)
 
                 # Draw per-slot color overlay

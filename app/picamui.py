@@ -4,7 +4,11 @@
 import sys, time, uuid
 from typing import Optional, Dict, List, Tuple
 import cv2, numpy as np
+import json
+import socket  # <-- add
+import signal, atexit
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtNetwork
 
 from dexsdk.ui.video_label import VideoLabel
 from dexsdk.utils import rotate90
@@ -20,7 +24,7 @@ class CollapsibleTray(QtWidgets.QWidget):
     def __init__(self, title: str = "Camera Controls", parent=None):
         super().__init__(parent)
         self._body = QtWidgets.QWidget()
-        self._body.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self._body.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         self._toggle = QtWidgets.QToolButton(text=title, checkable=True, checked=False)
         self._toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self._toggle.setArrowType(QtCore.Qt.RightArrow)
@@ -216,9 +220,10 @@ class CameraPanel(QtWidgets.QWidget):
         self.cam.set_manual_exposure(self.sp_exposure.value(), self.dsb_gain.value())
 
     def _apply_flicker(self):
-        mode = self.cmb_flicker.currentText()
-        hz = int(self.sp_flicker_hz.value())
-        self.cam.set_flicker_avoidance(mode, hz if mode == "manual" else None)
+        pass
+    #     mode = self.cmb_flicker.currentText()
+    #     hz = int(self.sp_flicker_hz.value())
+    #     self.cam.set_flicker_avoidance(mode, hz if mode == "manual" else None)
 
     def _apply_tuning(self):
         self.cam.set_image_adjustments(
@@ -231,11 +236,11 @@ class CameraPanel(QtWidgets.QWidget):
 
     def _reset_defaults(self):
         self._building = True
-        self.chk_ae.setChecked(True); self._on_ae_toggled(True)
+        self.chk_ae.setChecked(False); self._on_ae_toggled(False)
         self.cmb_meter.setCurrentText("matrix"); self.cam.set_metering("matrix")
         self.cmb_flicker.setCurrentText("auto"); self._apply_flicker()
         self.cmb_awb.setCurrentText("auto"); self.cam.set_awb_mode("auto")
-        self.cmb_af.setCurrentText("continuous"); self.cam.set_focus_mode("continuous")
+        self.cmb_af.setCurrentText("manual"); self.cam.set_focus_mode("manual")
         self.dsb_dioptre.setValue(0.0)
         self.dsb_brightness.setValue(0.0); self.dsb_contrast.setValue(1.0)
         self.dsb_saturation.setValue(1.0); self.dsb_sharpness.setValue(1.0)
@@ -289,17 +294,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video = VideoLabel()
         self.video.setMinimumSize(1024, 576)
         self.video.setStyleSheet("background:#111;")
-        left.addWidget(self.video, 1)
 
-        # Collapsible camera tray under monitor
+        # Collapsible camera tray under monitor (SCROLLABLE)
         self.cam_panel = CameraPanel(self.cam)
         self.tray = CollapsibleTray("Camera Controls")
         body = QtWidgets.QVBoxLayout()
         body.setContentsMargins(8, 4, 8, 4)
-        body.addWidget(self.cam_panel)
-        self.tray.set_body_layout(body)
-        left.addWidget(self.tray)
 
+        # NEW: scroll area wraps the camera panel
+        self.cam_scroll = QtWidgets.QScrollArea()
+        self.cam_scroll.setWidgetResizable(True)
+        self.cam_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.cam_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.cam_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        # Give the panel a “wants to be small” vertical policy so the scroll area manages it
+        self.cam_panel.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
+        self.cam_scroll.setWidget(self.cam_panel)
+
+        body.addWidget(self.cam_scroll)
+        self.tray.set_body_layout(body)
+
+        # NEW: vertical splitter to resize video vs controls
+        self.left_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.left_split.addWidget(self.video)
+        self.left_split.addWidget(self.tray)
+        self.left_split.setCollapsible(0, False)
+        self.left_split.setCollapsible(1, True)
+        self.left_split.setStretchFactor(0, 3)  # video gets more space
+        self.left_split.setStretchFactor(1, 1)
+
+        left.addWidget(self.left_split, 1)
         root.addLayout(left, 2)
 
         # Right: Control stack (Mode, Publisher, Processing, Templates, Detections)
@@ -317,10 +341,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # Publisher
         net_box = QtWidgets.QGroupBox("Publisher")
         net_form = QtWidgets.QFormLayout(net_box)
-        self.ed_ip = QtWidgets.QLineEdit("127.0.0.1")
+        self.ed_ip = QtWidgets.QLineEdit("10.1.156.99")
         self.sp_port = QtWidgets.QSpinBox(); self.sp_port.setRange(1, 65535); self.sp_port.setValue(40001)
         self.chk_publish = QtWidgets.QCheckBox("Publish JSON over UDP")
+        self.chk_publish.setChecked(True)
+        
+        self.sp_cmd_port = QtWidgets.QSpinBox(); self.sp_cmd_port.setRange(1, 65535); self.sp_cmd_port.setValue(40002)
+        self.chk_cmd_guard = QtWidgets.QCheckBox("Accept UDP trigger only from receiver IP")
+        self.chk_cmd_guard.setChecked(True)
+        
         net_form.addRow("IP", self.ed_ip); net_form.addRow("Port", self.sp_port); net_form.addRow(self.chk_publish)
+        net_form.addRow("Listen port (UDP cmds)", self.sp_cmd_port)
+        net_form.addRow(self.chk_cmd_guard)
         right.addWidget(net_box)
 
         # Processing
@@ -396,9 +428,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frame_count = 0
         self._fps_acc = 0.0; self._fps_n = 0
 
+        # --- UDP command listener (remote trigger) ---  NEW
+        self.cmd_sock = QtNetwork.QUdpSocket(self)
+        self._bind_cmd_socket(int(self.sp_cmd_port.value()))
+        self.cmd_sock.readyRead.connect(self._on_cmd_ready)
+        self.sp_cmd_port.valueChanged.connect(lambda v: self._bind_cmd_socket(int(v)))
+        self._last_remote_trigger_ts = 0.0
+        self._trigger_busy = False
+        # --- LED trigger client (hardcoded host/port; adjust if needed) ---
+        self._led_host = "127.0.0.1"
+        self._led_port = 12345
+        self._led_training_on = False  # track “LED kept ON” in training mode
+
+        
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._update)
         self.timer.start(0)
+        # Apply initial mode policy (will also turn LEDs ON in training)
+        self._on_mode_radio()
+
 
     # ---- UI callbacks ----
     def _on_mode_radio(self):
@@ -406,19 +454,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_trigger.setEnabled(self.mode == "trigger")
         # Freeze camera panel when in trigger mode
         self.cam_panel.set_enabled_by_mode(training=self.mode == "training")
-        # In training mode, never send JSON automatically (same rule as before)
+        # LED policy per mode
+        self._led_set_training(self.mode == "training")
+
 
     def _on_trigger_once(self):
-        if self.last_frame_rgb is None:
+        if self.last_frame_rgb is None or self._trigger_busy:
             return
-        proc = self._proc_frame_copy()
-        overlay, objects_report, _ = self.multi.compute_all(proc, draw=True)
-        self._last_overlay = overlay.copy()
-        self._overlay_until = time.time() + 1.0
-        self._populate_table(objects_report)
-        if self.publish_enabled:
-            payload = self._build_payload(objects_report, proc.shape[1], proc.shape[0], timings={"detect_ms": 0.0, "draw_ms": 0.0})
-            self.publisher.send(payload)
+        self._trigger_busy = True
+
+        def do_detect_then_postoff():
+            # Run detection with LEDs ON (pre-flash already elapsed)
+            proc = self._proc_frame_copy()
+            overlay, objects_report, _ = self.multi.compute_all(proc, draw=True)
+            self._last_overlay = overlay.copy()
+            self._overlay_until = time.time() + 1.0
+            self._populate_table(objects_report)
+            if self.publish_enabled:
+                payload = self._build_payload(objects_report, proc.shape[1], proc.shape[0],
+                                            timings={"detect_ms": 0.0, "draw_ms": 0.0})
+                self.publisher.send(payload)
+            # Post-hold 100 ms (only meaningful in trigger mode)
+            QtCore.QTimer.singleShot(100, lambda: (self._led_send(False),
+                                                setattr(self, "_trigger_busy", False)))
+
+        # Pre-flash 200 ms ON (in training mode LEDs are already ON; harmless to re-send)
+        self._led_send(True)
+        QtCore.QTimer.singleShot(200, do_detect_then_postoff)
+
+
 
     def _on_mode_changed(self, idx: int):
         use_color = (idx == 0)
@@ -485,6 +549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if draw.isNull():
             return
 
+        # Map from drawn (kept-aspect) coords to processed image coords
         sx = fw / float(draw.width()); sy = fh / float(draw.height())
         pts_img = []
         for p in qpoints:
@@ -495,8 +560,43 @@ class MainWindow(QtWidgets.QMainWindow):
             xi = (p.x() - draw.x()) * sx
             yi = (p.y() - draw.y()) * sy
             pts_img.append([xi, yi])
-
         pts_np = np.array(pts_img, dtype=np.float32)
+
+        # --- Case 1: exactly 4 points → treat as rotated rectangle and rectify
+        if len(pts_np) == 4:
+            # Order corners: tl, tr, br, bl (standard sum/diff trick)
+            s = pts_np.sum(axis=1)
+            diff = np.diff(pts_np, axis=1).ravel()
+            tl = pts_np[np.argmin(s)]
+            br = pts_np[np.argmax(s)]
+            tr = pts_np[np.argmin(diff)]
+            bl = pts_np[np.argmax(diff)]
+            src = np.array([tl, tr, br, bl], dtype=np.float32)
+
+            # Compute target rectangle size
+            def L2(a, b): return float(np.linalg.norm(a - b))
+            widthA  = L2(br, bl)
+            widthB  = L2(tr, tl)
+            heightA = L2(tr, br)
+            heightB = L2(tl, bl)
+            W = int(round(max(widthA, widthB)))
+            H = int(round(max(heightA, heightB)))
+
+            if W < 10 or H < 10:
+                QtWidgets.QMessageBox.warning(self, "ROI too small", "Please select a larger rectangle.")
+                return
+
+            dst = np.array([[0, 0], [W-1, 0], [W-1, H-1], [0, H-1]], dtype=np.float32)
+            M = cv2.getPerspectiveTransform(src, dst)
+            rectified = cv2.warpPerspective(frame, M, (W, H))
+
+            name = self.ed_name.text().strip() or f"Obj{self.active_slot+1}"
+            # Rectified rectangle is clean; mask not strictly necessary
+            self.multi.add_or_replace(self.active_slot, name, roi_bgr=rectified,
+                                    max_instances=int(self.sp_maxinst.value()))
+            return
+
+        # --- Case 2: generic polygon (fallback to your old masked crop)
         x1 = max(0, int(np.floor(np.min(pts_np[:, 0]))))
         y1 = max(0, int(np.floor(np.min(pts_np[:, 1]))))
         x2 = min(fw, int(np.ceil(np.max(pts_np[:, 0]))))
@@ -516,7 +616,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         name = self.ed_name.text().strip() or f"Obj{self.active_slot+1}"
-        self.multi.add_or_replace_polygon(self.active_slot, name, roi_bgr=roi, roi_mask=mask, max_instances=int(self.sp_maxinst.value()))
+        self.multi.add_or_replace_polygon(self.active_slot, name, roi_bgr=roi, roi_mask=mask,
+                                        max_instances=int(self.sp_maxinst.value()))
+
 
     # ---- Processing helpers ----
     def _grab(self):
@@ -623,6 +725,121 @@ class MainWindow(QtWidgets.QMainWindow):
             "result": {"counts": counts, "objects": objects_report},
             "timing_ms": {**timings, "total_ms": round(sum(timings.values()), 1)}
         }
+    # --- NEW: bind the UDP command socket
+    def _bind_cmd_socket(self, port: int):
+        try:
+            self.cmd_sock.close()
+        except Exception:
+            pass
+        # ShareAddress/ReuseAddressHint helps when restarting
+        ok = self.cmd_sock.bind(
+            QtNetwork.QHostAddress.AnyIPv4,
+            int(port),
+            QtNetwork.QUdpSocket.ShareAddress | QtNetwork.QUdpSocket.ReuseAddressHint
+        )
+        if hasattr(self, "status"):   # <-- add this guard if you like
+            self.status.showMessage(f"Cmd UDP bind {'ok' if ok else 'FAILED'} on :{port}", 3000)
+
+    # --- NEW: handle incoming UDP commands
+    def _on_cmd_ready(self):
+        now = time.time()
+        while self.cmd_sock.hasPendingDatagrams():
+            size = self.cmd_sock.pendingDatagramSize()
+            data, sender, sender_port = self.cmd_sock.readDatagram(size)
+            sender_ip = sender.toString().split('%')[0]  # strip scope if any
+
+            # Optional IP guard: only accept from the configured receiver IP
+            if self.chk_cmd_guard.isChecked():
+                allow_ip = self.ed_ip.text().strip()
+                if allow_ip and allow_ip != sender_ip:
+                    continue
+
+            # Decode & parse (plain "TRIGGER" or JSON {"cmd":"trigger", ...})
+            text = (data.decode('utf-8', errors='ignore')).strip()
+            cmd = text.lower()
+            payload = {}
+            try:
+                payload = json.loads(text)
+                cmd = str(payload.get('cmd', cmd)).lower()
+            except Exception:
+                pass
+
+            # Simple anti-spam throttle (250 ms)
+            if 'trigger' in cmd:
+                if (now - self._last_remote_trigger_ts) < 0.25:
+                    continue
+                self._last_remote_trigger_ts = now
+
+                # Optionally switch to trigger mode (if remote says so or if not already)
+                if self.mode != 'trigger':
+                    self.rad_trigger.setChecked(True)
+                    self._on_mode_radio()
+
+                # Optional: allow remote to set/override publish target for this session
+                pub = payload.get('publish') if isinstance(payload, dict) else None
+                if isinstance(pub, dict) and 'port' in pub and ('ip' in pub or 'host' in pub):
+                    ip = pub.get('ip') or pub.get('host')
+                    prt = int(pub['port'])
+                    try:
+                        self.ed_ip.setText(str(ip))
+                        self.sp_port.setValue(prt)
+                        self.publisher.configure(ip, prt)
+                        self.publish_enabled = True
+                        self.chk_publish.setChecked(True)
+                    except Exception:
+                        pass
+
+                # Fire the same routine as the UI button
+                self._on_trigger_once()
+
+                # Send a tiny ACK back (helpful for remote scripts)
+                try:
+                    ack = json.dumps({
+                        "ok": True,
+                        "session": self.session_id,
+                        "frame_id": self.frame_id,
+                        "mode": self.mode,
+                        "ts_ms": int(time.time() * 1000)
+                    }).encode('utf-8')
+                    self.cmd_sock.writeDatagram(ack, sender, sender_port)
+                except Exception:
+                    pass
+
+            elif 'ping' in cmd or 'status' in cmd:
+                # Health check
+                try:
+                    st = json.dumps({
+                        "ok": True,
+                        "mode": self.mode,
+                        "session": self.session_id,
+                        "frame_id": self.frame_id
+                    }).encode('utf-8')
+                    self.cmd_sock.writeDatagram(st, sender, sender_port)
+                except Exception:
+                    pass
+
+    def _led_send(self, on: bool):
+        """Fire-and-forget tiny TCP command to the NeoPixel server: '1' or '0'."""
+        try:
+            with socket.create_connection((self._led_host, self._led_port), timeout=0.2) as s:
+                s.sendall(b'1' if on else b'0')
+                try:
+                    s.recv(64)  # read ack, ignore contents
+                except Exception:
+                    pass
+        except Exception:
+            # Silent: if LED server not running, just proceed
+            pass
+
+    def _led_set_training(self, training: bool):
+        """Ensure LEDs stay ON in training, and OFF otherwise (outside flash windows)."""
+        if training and not self._led_training_on:
+            self._led_send(True)
+            self._led_training_on = True
+        elif not training and self._led_training_on:
+            self._led_send(False)
+            self._led_training_on = False
+
 
     # ---- Cleanup ----
     def closeEvent(self, event: QtGui.QCloseEvent):
@@ -632,7 +849,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception: pass
         try: self.cam.stop()
         except Exception: pass
+        try: self.cmd_sock.close()     # <-- add this
+        except Exception: pass
+        try: self._led_send(False)
+        except Exception: pass
         super().closeEvent(event)
+
 
 
 def main():
@@ -643,6 +865,16 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     w = MainWindow(camera_num=cam_num)
     w.show()
+    # Ensure LEDs turn OFF on Ctrl+C / SIGTERM and at process exit
+    def _graceful_kill(*_):
+        try: w._led_send(False)
+        except Exception: pass
+        QtWidgets.QApplication.quit()
+
+    signal.signal(signal.SIGINT, _graceful_kill)
+    signal.signal(signal.SIGTERM, _graceful_kill)
+    atexit.register(lambda: w._led_send(False))
+
     sys.exit(app.exec_())
 
 
