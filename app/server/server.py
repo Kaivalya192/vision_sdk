@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import signal
 from typing import Dict, List, Optional, Set
 
 import cv2
@@ -299,7 +300,7 @@ def main():
         except Exception:
             pass
 
-    for s in (asyncio.signals.SIGINT, asyncio.signals.SIGTERM):  # type: ignore[attr-defined]
+    for s in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(s, _sig)
         except Exception:
@@ -309,4 +310,3 @@ def main():
         loop.run_until_complete(srv.start())
     except asyncio.CancelledError:
         pass
-
