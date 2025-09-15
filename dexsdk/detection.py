@@ -1,2 +1,0 @@
-from .detect.primitive import *
-

@@ -12,7 +12,7 @@ from PyQt5 import QtNetwork
 
 from dexsdk.ui.video_label import VideoLabel
 from dexsdk.utils import rotate90
-from dexsdk.detection_multi import MultiTemplateMatcher
+from dexsdk.detect import MultiTemplateMatcher
 from dexsdk.net.publisher import UDPPublisher
 from dexsdk.camera.picam3 import PiCam3
 
