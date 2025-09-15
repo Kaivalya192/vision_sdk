@@ -18,7 +18,12 @@ from .router import CommandRouter
 from .streamer import Streamer
 from .types import ViewConfig, WSMessage
 from .measure_service import MeasureService, AnchorHelper
-from dexsdk.calib.store import load_json
+from .robot_calib import RobotMap
+from .calib_io import ensure_dir, save_k_json, load_k_json
+from dexsdk.calib.single_view_intrinsics import estimate_intrinsics
+from dexsdk.calib.plane_scale import compute_plane_scale
+import os
+import base64
 
 
 JPEG_QUAL = 80
@@ -37,26 +42,31 @@ class VisionServer:
         self.stream = Streamer(jpeg_quality=JPEG_QUAL, prefer_b64=True)
         self.router = CommandRouter()
         self.anchor = AnchorHelper()
+        self._anchor_name = ""
+        self._last_anchor_pose = None
 
         def _get_mm_scale():
-            data = load_json("K.json") or {}
-            sx = sy = None
-            # Try common locations
-            if isinstance(data, dict):
+            data = load_k_json(self._k_path) or {}
+            try:
                 ps = data.get("plane_scale") or {}
-                if isinstance(ps, dict):
-                    mmpp = ps.get("mm_per_px") or ps.get("mm_per_pixel") or ps.get("mmpp")
-                    if isinstance(mmpp, (list, tuple)) and len(mmpp) >= 2:
-                        sx, sy = float(mmpp[0]), float(mmpp[1])
-                if sx is None or sy is None:
-                    mmpp = data.get("mm_per_px")
-                    if isinstance(mmpp, (list, tuple)) and len(mmpp) >= 2:
-                        sx, sy = float(mmpp[0]), float(mmpp[1])
-            if sx is None or sy is None:
-                return (1.0, 1.0), "px"
-            return (sx, sy), "mm"
+                sx = float(ps.get("mm_per_px_x"))
+                sy = float(ps.get("mm_per_px_y"))
+                if sx > 0 and sy > 0:
+                    return (sx, sy), "mm"
+            except Exception:
+                pass
+            return (1.0, 1.0), "px"
 
+        self._k_path = os.path.expanduser("~/.vision_sdk/K.json")
+        self._robot_path = os.path.expanduser("~/.vision_sdk/robot_map.json")
+        ensure_dir(os.path.dirname(self._k_path))
         self.measure = MeasureService(_get_mm_scale)
+        self.robot = RobotMap()
+        # try load previous robot map
+        try:
+            self.robot.load(self._robot_path)
+        except Exception:
+            pass
 
         self.clients: Set[WebSocketServerProtocol] = set()
         self.mode = "training"  # training | trigger
@@ -80,7 +90,7 @@ class VisionServer:
             await ws.send(json.dumps({"type": "pong", "ts_ms": int(time.time() * 1000), **({"req_id": msg["req_id"]} if "req_id" in msg else {})}))
 
         async def h_set_mode(ws, msg: WSMessage):
-            self.mode = str(msg.get("mode", "training").lower())
+            self.mode = str(msg.get("mode", "training")).lower()
             self.mode = "training" if self.mode not in ("training", "trigger") else self.mode
             await r.send_acked(ws, msg)
 
@@ -238,21 +248,31 @@ class VisionServer:
 
         async def h_set_anchor_source(ws, msg: WSMessage):
             self._anchor_name = str(msg.get("object", "")).strip()
+            # reset origin and last pose when source changes
+            try:
+                self.anchor.reset_origin()
+            except Exception:
+                pass
+            self._last_anchor_pose = None
             await r.send_acked(ws, msg)
 
         async def h_run_measure(ws, msg: WSMessage):
             job = msg.get("job", {}) or {}
             use_anchor = bool(msg.get("anchor", False))
-            # Get working ROI
-            roi = job.get("roi")
-            if use_anchor and roi is not None and getattr(self.anchor, "prev_pose", None) and getattr(self.anchor, "last_pose", None):
-                roi = self.anchor.warp_rect(tuple(int(v) for v in roi))
-                job = {**job, "roi": list(roi)}
-
             frame = self.last_proc_bgr.copy() if self.last_proc_bgr is not None else None
             if frame is None:
                 await r.send_acked(ws, msg, ok=False, error="no frame")
                 return
+            # Apply anchoring if requested
+            roi = job.get("roi")
+            if use_anchor and roi is not None and self._last_anchor_pose is not None:
+                if self.anchor.origin_pose is None:
+                    self.anchor.set_origin(self._last_anchor_pose, tuple(int(v) for v in roi))
+                else:
+                    self.anchor.update(self._last_anchor_pose)
+                H, W = frame.shape[:2]
+                new_roi = self.anchor.warp_rect(tuple(int(v) for v in (self.anchor.base_rect or tuple(roi))), W, H)
+                job = {**job, "roi": list(new_roi)}
 
             loop = asyncio.get_running_loop()
 
@@ -270,6 +290,103 @@ class VisionServer:
 
         r.register("set_anchor_source", h_set_anchor_source)
         r.register("run_measure", h_run_measure)
+
+        # ---- One-click calibration ---------------------------------------
+        async def h_calibrate(ws, msg: WSMessage):
+            await r.send_acked(ws, msg)
+            frame = self.last_proc_bgr.copy() if self.last_proc_bgr is not None else None
+            if frame is None:
+                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": False, "error": "no frame"})
+                return
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            loop = asyncio.get_running_loop()
+
+            def _work():
+                intr = estimate_intrinsics(gray)
+                plane = compute_plane_scale(gray, K_json=None, cfg={"target_width": 0, "pair_weight": 0.5, "no_bias": False})
+                payload = {
+                    "model": intr.get("model"),
+                    "K": intr.get("K"),
+                    "dist": intr.get("dist"),
+                    "image_size": intr.get("image_size"),
+                    "rms_reprojection_error_px": intr.get("rms_reprojection_error_px"),
+                    "rmse_px": intr.get("rmse_px"),
+                    "plane_scale": plane.get("summary", {}).get("plane_scale", {}),
+                    "created_at_ms": int(time.time() * 1000),
+                }
+                # overlay: draw tag corners if present
+                ov = frame.copy()
+                for d in plane.get("detections", []):
+                    try:
+                        pts = d.get("corners_px")
+                        if pts is None:
+                            continue
+                        arr = np.array(pts, dtype=np.float32)
+                        if arr.ndim == 3:
+                            arr = arr.reshape(-1, 2)
+                        if arr.shape[0] >= 4:
+                            q = arr.astype(np.int32)
+                            cv2.polylines(ov, [q], True, (0, 255, 0), 2)
+                    except Exception:
+                        pass
+                ps = payload["plane_scale"]
+                pxmmx = ps.get("px_per_mm_x"); pxmmy = ps.get("px_per_mm_y")
+                mmppx = ps.get("mm_per_px_x"); mmppy = ps.get("mm_per_px_y")
+                txt = f"px/mm X={pxmmx:.3f} Y={pxmmy:.3f}\nmm/px X={mmppx:.5f} Y={mmppy:.5f}" if ps else "no plane scale"
+                y0 = 24
+                for i, line in enumerate(txt.split("\n")):
+                    cv2.putText(ov, line, (12, y0 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(ov, line, (12, y0 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                save_k_json(self._k_path, payload)
+                return payload, ov
+
+            try:
+                payload, ov = await loop.run_in_executor(None, _work)
+                jpeg = await loop.run_in_executor(None, lambda: cv2.imencode(".jpg", ov, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes())
+                b64 = base64.b64encode(jpeg).decode("ascii")
+                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": True, "saved": self._k_path, "summary": payload, "overlay_jpeg_b64": b64})
+            except Exception as e:
+                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": False, "error": str(e)})
+
+        r.register("calibrate_one_click", h_calibrate)
+
+        # ---- Robot calibration -------------------------------------------
+        async def h_robot_pairs(ws, msg: WSMessage):
+            op = str(msg.get("op", "")).lower()
+            if op == "add":
+                self.robot.add_pair(msg.get("robot", [0, 0]), msg.get("pixel", [0, 0]))
+                self.robot.save(self._robot_path)
+                await r.send_acked(ws, msg)
+            elif op == "clear":
+                self.robot.clear(); self.robot.save(self._robot_path)
+                await r.send_acked(ws, msg)
+            else:
+                await r.send_acked(ws, msg, ok=False, error="unknown op")
+
+        async def h_robot_solve(ws, msg: WSMessage):
+            loop = asyncio.get_running_loop()
+            try:
+                params = await loop.run_in_executor(None, self.robot.solve)
+                self.robot.save(self._robot_path)
+                await self.stream.broadcast_json(self.clients, {"type": "robot_calibration", "ok": True, "params": params})
+                await r.send_acked(ws, msg)
+            except Exception as e:
+                await self.stream.broadcast_json(self.clients, {"type": "robot_calibration", "ok": False, "error": str(e)})
+                await r.send_acked(ws, msg, ok=False, error=str(e))
+
+        async def h_robot_apply(ws, msg: WSMessage):
+            try:
+                px, py = msg.get("pixel", [0, 0])
+                rx, ry = self.robot.apply(float(px), float(py))
+                await self.stream.broadcast_json(self.clients, {"type": "robot_apply", "ok": True, "robot": [rx, ry]})
+                await r.send_acked(ws, msg)
+            except Exception as e:
+                await self.stream.broadcast_json(self.clients, {"type": "robot_apply", "ok": False, "error": str(e)})
+                await r.send_acked(ws, msg, ok=False, error=str(e))
+
+        r.register("robot_pairs", h_robot_pairs)
+        r.register("robot_solve", h_robot_solve)
+        r.register("robot_apply", h_robot_apply)
 
     async def start(self):
         async with websockets.serve(
@@ -327,11 +444,15 @@ class VisionServer:
                             if o.get("name") == name_sel and o.get("detections"):
                                 # pick first
                                 pose = o["detections"][0].get("pose") or {}
-                                self.anchor.set_reference({
+                                cur_pose = {
                                     "x": float(pose.get("x", 0.0)),
                                     "y": float(pose.get("y", 0.0)),
                                     "theta_deg": float(pose.get("theta_deg", pose.get("theta", 0.0))),
-                                })
+                                }
+                                self._last_anchor_pose = cur_pose
+                                # keep updating for origin-based anchoring
+                                if self.anchor.origin_pose is not None:
+                                    self.anchor.update(cur_pose)
                                 break
                 except Exception:
                     pass

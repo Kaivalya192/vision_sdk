@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Callable
 
 import cv2
 import numpy as np
@@ -9,39 +9,69 @@ import numpy as np
 from dexsdk.measure.core import MeasureContext
 from dexsdk.measure.geometry import DistanceP2P, LineFit, PointPick
 from dexsdk.measure.schema import make_measure, make_result
+from .calib_io import load_k_json
 
 
 class AnchorHelper:
     def __init__(self):
-        self.prev_pose: Optional[Dict[str, float]] = None
-        self.last_pose: Optional[Dict[str, float]] = None
+        self.origin_pose: Optional[Dict[str, float]] = None
+        self.current_pose: Optional[Dict[str, float]] = None
+        self.base_rect: Optional[Tuple[int, int, int, int]] = None
 
-    def set_reference(self, pose: Dict[str, float]) -> None:
-        # pose must contain x, y, theta_deg
-        self.prev_pose = self.last_pose
-        self.last_pose = {"x": float(pose.get("x", 0.0)), "y": float(pose.get("y", 0.0)), "theta_deg": float(pose.get("theta_deg", 0.0))}
+    def set_origin(self, pose: Dict[str, float], base_rect: Tuple[int, int, int, int]) -> None:
+        self.origin_pose = {
+            "x": float(pose.get("x", 0.0)),
+            "y": float(pose.get("y", 0.0)),
+            "theta_deg": float(pose.get("theta_deg", 0.0)),
+        }
+        self.base_rect = (int(base_rect[0]), int(base_rect[1]), int(base_rect[2]), int(base_rect[3]))
+        self.current_pose = dict(self.origin_pose)
 
-    def warp_rect(self, rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
-        if not self.prev_pose or not self.last_pose:
+    def reset_origin(self) -> None:
+        self.origin_pose = None
+        self.base_rect = None
+
+    def update(self, pose: Dict[str, float]) -> None:
+        self.current_pose = {
+            "x": float(pose.get("x", 0.0)),
+            "y": float(pose.get("y", 0.0)),
+            "theta_deg": float(pose.get("theta_deg", 0.0)),
+        }
+
+    def warp_rect(self, rect: Tuple[int, int, int, int], img_w: int, img_h: int) -> Tuple[int, int, int, int]:
+        if not self.origin_pose or not self.current_pose:
             return rect
         x, y, w, h = rect
-        cx = x + w * 0.5
-        cy = y + h * 0.5
-        # delta pose (center + rotation only)
-        dx = self.last_pose["x"] - self.prev_pose["x"]
-        dy = self.last_pose["y"] - self.prev_pose["y"]
-        dth = math.radians(self.last_pose["theta_deg"] - self.prev_pose["theta_deg"])
-        # rotate rectangle corners around center by dth, then translate by (dx,dy)
-        corners = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32)
-        rot = np.array([[math.cos(dth), -math.sin(dth)], [math.sin(dth), math.cos(dth)]], dtype=np.float32)
-        shifted = corners - np.array([[cx, cy]], dtype=np.float32)
-        rotated = shifted @ rot.T + np.array([[cx + dx, cy + dy]], dtype=np.float32)
-        xmin = float(np.min(rotated[:, 0])); xmax = float(np.max(rotated[:, 0]))
-        ymin = float(np.min(rotated[:, 1])); ymax = float(np.max(rotated[:, 1]))
-        nx = int(round(xmin)); ny = int(round(ymin))
-        nw = max(1, int(round(xmax - xmin)))
-        nh = max(1, int(round(ymax - ymin)))
+        cx, cy = x + 0.5 * w, y + 0.5 * h
+        dth = math.radians(self.current_pose["theta_deg"] - self.origin_pose["theta_deg"])
+        dx = self.current_pose["x"] - self.origin_pose["x"]
+        dy = self.current_pose["y"] - self.origin_pose["y"]
+        # rotate center around itself (no-op), then translate by (dx,dy)
+        rcx = cx * math.cos(dth) - cy * math.sin(dth)
+        rcy = cx * math.sin(dth) + cy * math.cos(dth)
+        ncx, ncy = rcx + dx, rcy + dy
+        nx = int(round(ncx - 0.5 * w)); ny = int(round(ncy - 0.5 * h))
+        nx = max(0, min(int(img_w - 1), nx))
+        ny = max(0, min(int(img_h - 1), ny))
+        nw = max(1, min(int(img_w - nx), int(w)))
+        nh = max(1, min(int(img_h - ny), int(h)))
         return nx, ny, nw, nh
+
+
+def make_get_mm_scale_fn(path: str = "~/.vision_sdk/K.json") -> Callable[[], Tuple[Tuple[float, float], str]]:
+    def _fn() -> Tuple[Tuple[float, float], str]:
+        data = load_k_json(path) or {}
+        try:
+            ps = data.get("plane_scale") or {}
+            sx = float(ps.get("mm_per_px_x"))
+            sy = float(ps.get("mm_per_px_y"))
+            if sx > 0 and sy > 0:
+                return (sx, sy), "mm"
+        except Exception:
+            pass
+        return (1.0, 1.0), "px"
+
+    return _fn
 
 
 class MeasureService:
@@ -146,4 +176,3 @@ class MeasureService:
 
         packet = make_result(units=ctx.units, measures=measures, primitives=prim)
         return packet, overlay
-
