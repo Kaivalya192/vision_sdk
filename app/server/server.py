@@ -17,6 +17,8 @@ from .led_service import LEDClient, LEDStateMachine
 from .router import CommandRouter
 from .streamer import Streamer
 from .types import ViewConfig, WSMessage
+from .measure_service import MeasureService, AnchorHelper
+from dexsdk.calib.store import load_json
 
 
 JPEG_QUAL = 80
@@ -34,6 +36,27 @@ class VisionServer:
         self.detect = DetectService(max_slots=MAX_SLOTS, min_center_dist_px=40)
         self.stream = Streamer(jpeg_quality=JPEG_QUAL, prefer_b64=True)
         self.router = CommandRouter()
+        self.anchor = AnchorHelper()
+
+        def _get_mm_scale():
+            data = load_json("K.json") or {}
+            sx = sy = None
+            # Try common locations
+            if isinstance(data, dict):
+                ps = data.get("plane_scale") or {}
+                if isinstance(ps, dict):
+                    mmpp = ps.get("mm_per_px") or ps.get("mm_per_pixel") or ps.get("mmpp")
+                    if isinstance(mmpp, (list, tuple)) and len(mmpp) >= 2:
+                        sx, sy = float(mmpp[0]), float(mmpp[1])
+                if sx is None or sy is None:
+                    mmpp = data.get("mm_per_px")
+                    if isinstance(mmpp, (list, tuple)) and len(mmpp) >= 2:
+                        sx, sy = float(mmpp[0]), float(mmpp[1])
+            if sx is None or sy is None:
+                return (1.0, 1.0), "px"
+            return (sx, sy), "mm"
+
+        self.measure = MeasureService(_get_mm_scale)
 
         self.clients: Set[WebSocketServerProtocol] = set()
         self.mode = "training"  # training | trigger
@@ -213,6 +236,41 @@ class VisionServer:
         r.register("set_slot_state", h_set_slot_state)
         r.register("af_trigger", h_af_trigger)
 
+        async def h_set_anchor_source(ws, msg: WSMessage):
+            self._anchor_name = str(msg.get("object", "")).strip()
+            await r.send_acked(ws, msg)
+
+        async def h_run_measure(ws, msg: WSMessage):
+            job = msg.get("job", {}) or {}
+            use_anchor = bool(msg.get("anchor", False))
+            # Get working ROI
+            roi = job.get("roi")
+            if use_anchor and roi is not None and getattr(self.anchor, "prev_pose", None) and getattr(self.anchor, "last_pose", None):
+                roi = self.anchor.warp_rect(tuple(int(v) for v in roi))
+                job = {**job, "roi": list(roi)}
+
+            frame = self.last_proc_bgr.copy() if self.last_proc_bgr is not None else None
+            if frame is None:
+                await r.send_acked(ws, msg, ok=False, error="no frame")
+                return
+
+            loop = asyncio.get_running_loop()
+
+            def _work():
+                return self.measure.run_job(frame, job)
+
+            packet, ov = await loop.run_in_executor(None, _work)
+            # Broadcast result
+            jpeg = await loop.run_in_executor(None, lambda: cv2.imencode(".jpg", ov, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes())
+            import base64
+
+            b64 = base64.b64encode(jpeg).decode("ascii")
+            await self.stream.broadcast_json(self.clients, {"type": "measures", "packet": packet, "overlay_jpeg_b64": b64})
+            await r.send_acked(ws, msg)
+
+        r.register("set_anchor_source", h_set_anchor_source)
+        r.register("run_measure", h_run_measure)
+
     async def start(self):
         async with websockets.serve(
             self._ws_handler, WS_HOST, WS_PORT, ping_interval=None, max_size=16 * 1024 * 1024
@@ -261,6 +319,22 @@ class VisionServer:
             objs: List[Dict] = []
             if detect_now:
                 overlay_bgr, objs, _ = self.detect.compute_all(bgr_small, draw=True)
+                # update anchor reference if selected present
+                try:
+                    name_sel = getattr(self, "_anchor_name", "")
+                    if name_sel:
+                        for o in objs:
+                            if o.get("name") == name_sel and o.get("detections"):
+                                # pick first
+                                pose = o["detections"][0].get("pose") or {}
+                                self.anchor.set_reference({
+                                    "x": float(pose.get("x", 0.0)),
+                                    "y": float(pose.get("y", 0.0)),
+                                    "theta_deg": float(pose.get("theta_deg", pose.get("theta", 0.0))),
+                                })
+                                break
+                except Exception:
+                    pass
 
             # broadcast
             if self.clients:

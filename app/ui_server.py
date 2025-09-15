@@ -367,7 +367,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl=QtWidgets.QTableWidget(0,8)
         self.tbl.setHorizontalHeaderLabels(["Obj","Id","x","y","θ","score","inliers","center"])
         self.tbl.horizontalHeader().setStretchLastSection(True); dv.addWidget(self.tbl)
-        right.addWidget(det_box,1); root.addLayout(right,1)
+        right.addWidget(det_box,1)
+
+        meas_box=QtWidgets.QGroupBox("Measure"); mv=QtWidgets.QFormLayout(meas_box)
+        self.chk_anchor=QtWidgets.QCheckBox("Anchor ROI to detection"); self.chk_anchor.setChecked(False)
+        self.cmb_anchor=QtWidgets.QComboBox(); self.cmb_anchor.setEditable(True); self.cmb_anchor.setEditText("Obj1")
+        hbM=QtWidgets.QHBoxLayout(); self.btn_pick=QtWidgets.QPushButton("Pick point"); self.btn_p2p=QtWidgets.QPushButton("P2P distance"); self.btn_fit=QtWidgets.QPushButton("Fit line"); self.btn_p2l=QtWidgets.QPushButton("Point→Line")
+        for w in (self.btn_pick,self.btn_p2p,self.btn_fit,self.btn_p2l): hbM.addWidget(w)
+        self.lbl_meas=QtWidgets.QLabel("–")
+        mv.addRow("Anchor source", self.cmb_anchor)
+        mv.addRow(self.chk_anchor)
+        mv.addRow(hbM)
+        mv.addRow("Result", self.lbl_meas)
+        right.addWidget(meas_box)
+
+        root.addLayout(right,1)
 
         # status -------------------------------------------------------------
         self.status=QtWidgets.QStatusBar(); self.setStatusBar(self.status)
@@ -389,6 +403,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.paramsChanged.connect(lambda p: self._send({"type":"set_params","params":p}))
         self.cam_panel.viewChanged.connect(lambda v: self._send({"type":"set_view",**v}))
         self.cam_panel.afTriggerRequested.connect(lambda: self._send({"type":"af_trigger"}))
+        # measure wiring
+        self.btn_pick.clicked.connect(lambda: self._run_measure("point_pick"))
+        self.btn_fit.clicked.connect(lambda: self._run_measure("line_fit"))
+        self.btn_p2p.clicked.connect(lambda: self._run_measure("distance_p2p"))
+        self.btn_p2l.clicked.connect(lambda: self._run_measure("distance_p2l"))
+        self.cmb_anchor.currentTextChanged.connect(lambda name: self._send({"type":"set_anchor_source","object":name}))
 
         self._ping=QtCore.QTimer(interval=10000,timeout=lambda: self._send({"type":"ping"}))
 
@@ -411,6 +431,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if t=="hello": self.session_id=msg.get("session_id","-"); self.lbl_sess.setText(f"Session {self.session_id}")
         elif t=="frame": self._frame(msg)
         elif t=="detections": self._dets(msg)
+        elif t=="measures": self._meas(msg)
         elif t=="ack":
             if msg.get("cmd")=="af_trigger" and msg.get("ok") and msg.get("error") is None:
                 d=msg.get("dioptre")
@@ -443,6 +464,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if "overlay_jpeg_b64" in msg:
             qi=self._decode(msg["overlay_jpeg_b64"]); 
             if qi: self._last_overlay_img=qi; self._overlay_until=time.time()+1.0; self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
+
+    def _meas(self,msg:Dict):
+        pkt=msg.get("packet",{})
+        meas=pkt.get("measures",[])
+        if meas:
+            m=meas[0]
+            val=m.get("value",0.0); kind=m.get("kind","?"); ok=(m.get("pass",True) is True)
+            self.lbl_meas.setText(f"{kind}: {val:.3f} {pkt.get('units','px')} ({'PASS' if ok else 'FAIL'})")
+        if "overlay_jpeg_b64" in msg:
+            qi=self._decode(msg["overlay_jpeg_b64"])
+            if qi:
+                self._last_overlay_img=qi; self._overlay_until=time.time()+1.0
+                self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
 
     def _table(self, objs: List[Dict]):
         rows = sum(len(o.get("detections", [])) for o in objs)
@@ -493,6 +527,7 @@ class MainWindow(QtWidgets.QMainWindow):
         (x,y)=self._disp_to_proc(sel.topLeft()); w=sel.width()*self.last_frame_wh[0]/draw.width()
         h=sel.height()*self.last_frame_wh[1]/draw.height()
         if w<10 or h<10: return
+        self._last_roi=[int(x),int(y),int(w),int(h)]
         self._send({"type":"add_template_rect","slot":int(self.cmb_slot.currentIndex()),
                     "name":self.ed_name.text() or f"Obj{self.cmb_slot.currentIndex()+1}",
                     "rect":[int(x),int(y),int(w),int(h)],"max_instances":int(self.sp_max.value())})
@@ -504,6 +539,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pts=[self._disp_to_proc(p) for p in qpts]
         xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
         if max(xs)-min(xs)<10 or max(ys)-min(ys)<10: return
+        self._last_poly=[[float(x),float(y)] for x,y in pts]
         self._send({"type":"add_template_poly","slot":int(self.cmb_slot.currentIndex()),
                     "name":self.ed_name.text() or f"Obj{self.cmb_slot.currentIndex()+1}",
                     "points":[[round(x,1),round(y,1)] for x,y in pts],
@@ -517,6 +553,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _send(self,obj): 
         try: self.ws.sendTextMessage(json.dumps(obj,separators=(',',':')))
         except Exception: pass
+
+    # ----------- measure trigger -----------------------------------------
+    def _run_measure(self, tool: str):
+        roi = getattr(self, "_last_roi", None)
+        if roi is None:
+            self.status.showMessage("Select a Rect ROI first", 3000)
+            return
+        job={"tool":tool,"params":{},"roi":roi}
+        if tool=="point_pick":
+            x,y,w,h=roi; job["params"]={"hint_xy":[x+w*0.5,y+h*0.5]}
+        elif tool=="distance_p2p":
+            x,y,w,h=roi; job["params"]={"p1":[x,y+h*0.5],"p2":[x+w,y+h*0.5]}
+        self._send({"type":"run_measure","job":job,"anchor":bool(self.chk_anchor.isChecked())})
 
 
 # ---------------------------------------------------------------------------#
