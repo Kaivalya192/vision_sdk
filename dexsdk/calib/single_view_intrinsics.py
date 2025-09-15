@@ -74,10 +74,13 @@ def estimate_intrinsics(gray: np.ndarray) -> Dict[str, Any]:
     K0 = np.array([[f0, 0, w / 2.0], [0, f0, h / 2.0], [0, 0, 1.0]], dtype=np.float64)
     dist0 = np.zeros((8, 1), dtype=np.float64)
 
+    fix_skew_flag = getattr(cv2, "CALIB_FIX_SKEW", 0)
+    if not fix_skew_flag:
+        print('[WARN] OpenCV build lacks CALIB_FIX_SKEW; continuing without that constraint.')
     flags = (
         cv2.CALIB_USE_INTRINSIC_GUESS
         | cv2.CALIB_FIX_PRINCIPAL_POINT
-        | cv2.CALIB_FIX_SKEW
+        | fix_skew_flag
         | cv2.CALIB_ZERO_TANGENT_DIST
         | cv2.CALIB_FIX_K3
         | cv2.CALIB_FIX_K4
