@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from dexsdk.detection_multi import MultiTemplateMatcher
+from dexsdk.detect import MultiTemplateMatcher
 
 
 class DetectService:
