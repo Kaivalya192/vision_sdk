@@ -5,7 +5,7 @@ RPi Vision Client – with Results dock and Measure/Calibrate controls
 """
 
 import sys, time, base64, json
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 
@@ -195,8 +195,142 @@ class CameraPanel(QtWidgets.QWidget):
         self.cmb_af.setCurrentText("manual"); self.dsb_dioptre.setValue(0.0)
         for w,val in [(self.dsb_bri,0.0),(self.dsb_con,1.0),(self.dsb_sat,1.0),(self.dsb_sha,1.0)]: w.setValue(val)
         self.cmb_den.setCurrentText("fast"); self.chk_flip_h.setChecked(False); self.chk_flip_v.setChecked(False); self._rot_q=0
+
+
         self.blockSignals(False); self._emit_params(); self._emit_view()
 
+
+
+    def get_state(self) -> Dict[str, Any]:
+        return dict(
+            auto_exposure=self.chk_ae.isChecked(),
+            exposure_us=int(self.sp_exp.value()),
+            gain=float(self.dsb_gain.value()),
+            fps=float(self.dsb_fps.value()),
+            awb_mode=self.cmb_awb.currentText(),
+            awb_rb=[float(self.dsb_awb_r.value()), float(self.dsb_awb_b.value())],
+            focus_mode=self.cmb_af.currentText(),
+            dioptre=float(self.dsb_dioptre.value()),
+            brightness=float(self.dsb_bri.value()),
+            contrast=float(self.dsb_con.value()),
+            saturation=float(self.dsb_sat.value()),
+            sharpness=float(self.dsb_sha.value()),
+            denoise=self.cmb_den.currentText(),
+            flip_h=self.chk_flip_h.isChecked(),
+            flip_v=self.chk_flip_v.isChecked(),
+            rot_quadrant=int(self._rot_q),
+        )
+
+    def apply_state(self, state: Dict[str, Any]):
+        if not isinstance(state, dict):
+            return
+
+        def as_bool(val):
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.lower() in ("1", "true", "yes", "on")
+            if isinstance(val, (int, float)):
+                return bool(val)
+            return None
+
+        def as_int(val):
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return None
+
+        def as_float(val):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        def set_combo_text(combo: QtWidgets.QComboBox, text):
+            if isinstance(text, str):
+                idx = combo.findText(text)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+        widgets = [
+            self.chk_ae,
+            self.sp_exp,
+            self.dsb_gain,
+            self.dsb_fps,
+            self.cmb_awb,
+            self.dsb_awb_r,
+            self.dsb_awb_b,
+            self.cmb_af,
+            self.dsb_dioptre,
+            self.dsb_bri,
+            self.dsb_con,
+            self.dsb_sat,
+            self.dsb_sha,
+            self.cmb_den,
+            self.chk_flip_h,
+            self.chk_flip_v,
+        ]
+        blocked = []
+        for w in widgets:
+            try:
+                blocked.append((w, w.blockSignals(True)))
+            except AttributeError:
+                pass
+        try:
+            val = as_bool(state.get("auto_exposure"))
+            if val is not None:
+                self.chk_ae.setChecked(val)
+            val = as_int(state.get("exposure_us"))
+            if val is not None:
+                self.sp_exp.setValue(val)
+            val = as_float(state.get("gain"))
+            if val is not None:
+                self.dsb_gain.setValue(val)
+            val = as_float(state.get("fps"))
+            if val is not None:
+                self.dsb_fps.setValue(val)
+            set_combo_text(self.cmb_awb, state.get("awb_mode"))
+            rb = state.get("awb_rb")
+            if isinstance(rb, (list, tuple)) and len(rb) >= 2:
+                val = as_float(rb[0])
+                if val is not None:
+                    self.dsb_awb_r.setValue(val)
+                val = as_float(rb[1])
+                if val is not None:
+                    self.dsb_awb_b.setValue(val)
+            set_combo_text(self.cmb_af, state.get("focus_mode"))
+            val = as_float(state.get("dioptre"))
+            if val is not None:
+                self.dsb_dioptre.setValue(val)
+            val = as_float(state.get("brightness"))
+            if val is not None:
+                self.dsb_bri.setValue(val)
+            val = as_float(state.get("contrast"))
+            if val is not None:
+                self.dsb_con.setValue(val)
+            val = as_float(state.get("saturation"))
+            if val is not None:
+                self.dsb_sat.setValue(val)
+            val = as_float(state.get("sharpness"))
+            if val is not None:
+                self.dsb_sha.setValue(val)
+            set_combo_text(self.cmb_den, state.get("denoise"))
+            val = as_bool(state.get("flip_h"))
+            if val is not None:
+                self.chk_flip_h.setChecked(val)
+            val = as_bool(state.get("flip_v"))
+            if val is not None:
+                self.chk_flip_v.setChecked(val)
+            rot = as_int(state.get("rot_quadrant"))
+            if rot is not None:
+                self._rot_q = max(0, min(3, rot))
+        finally:
+            for obj, prev in blocked:
+                obj.blockSignals(prev)
+
+        manual = self.cmb_awb.currentText() == "manual"
+        self.dsb_awb_r.setEnabled(manual)
+        self.dsb_awb_b.setEnabled(manual)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -212,6 +346,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fps_acc=0.0; self._fps_n=0; self._last_ts=time.perf_counter()
         self._overlay_until=0.0; self._last_overlay_img=None
         self._last_roi=None
+        self._settings=QtCore.QSettings('vision_sdk','ui_client')
+        self._log_buffer=[]
 
         # central: video + left controls (scroll)
         central=QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -341,6 +477,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ping=QtCore.QTimer(interval=10000,timeout=lambda: self._send({"type":"ping"}))
 
+        self._load_settings()
+
     def eventFilter(self, obj, event):
         if obj is getattr(self, "controlsPanel", None) and event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.Show):
             action = getattr(self, "controlsPanelAction", None)
@@ -350,7 +488,185 @@ class MainWindow(QtWidgets.QMainWindow):
                     action.setChecked(visible)
         return super().eventFilter(obj, event)
 
+
+
+    def closeEvent(self, event):
+        try:
+            self._save_settings()
+        finally:
+            super().closeEvent(event)
+
+    def _load_settings(self):
+        settings = self._settings
+
+        def to_bool(val):
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                lower = val.strip().lower()
+                if lower in ("1", "true", "yes", "on"):
+                    return True
+                if lower in ("0", "false", "no", "off"):
+                    return False
+            if isinstance(val, (int, float)):
+                return bool(val)
+            return None
+
+        def to_int(val):
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return None
+
+        def to_str(val):
+            return val if isinstance(val, str) else None
+
+        try:
+            geom = to_str(settings.value('window/geometry'))
+            if geom:
+                self.restoreGeometry(QtCore.QByteArray.fromHex(geom.encode()))
+        except Exception:
+            pass
+
+        try:
+            state = to_str(settings.value('window/state'))
+            if state:
+                self.restoreState(QtCore.QByteArray.fromHex(state.encode()))
+        except Exception:
+            pass
+
+        host = to_str(settings.value('connection/host'))
+        if host:
+            self.ed_host.setText(host)
+
+        mode = to_str(settings.value('mode/current'))
+        if mode == 'trigger':
+            self.rad_trig.setChecked(True)
+        elif mode == 'training':
+            self.rad_train.setChecked(True)
+
+        widgets_to_block = [
+            self.cmb_w,
+            self.sp_every,
+            self.cmb_slot,
+            self.sp_max,
+            self.chk_en,
+            self.cmb_anchor,
+            self.chk_anchor,
+        ]
+        blocked = []
+        for w in widgets_to_block:
+            blocked.append((w, w.blockSignals(True)))
+        try:
+            width = to_str(settings.value('processing/proc_width'))
+            if width and self.cmb_w.findText(width) >= 0:
+                self.cmb_w.setCurrentText(width)
+
+            every = to_int(settings.value('processing/detect_every'))
+            if every is not None:
+                self.sp_every.setValue(every)
+
+            slot = to_int(settings.value('templates/slot_index'))
+            if slot is not None and 0 <= slot < self.cmb_slot.count():
+                self.cmb_slot.setCurrentIndex(slot)
+
+            name = to_str(settings.value('templates/name'))
+            if name is not None:
+                self.ed_name.setText(name)
+
+            max_instances = to_int(settings.value('templates/max'))
+            if max_instances is not None:
+                self.sp_max.setValue(max_instances)
+
+            enabled = to_bool(settings.value('templates/enabled'))
+            if enabled is not None:
+                self.chk_en.setChecked(enabled)
+
+            anchor_name = to_str(settings.value('templates/anchor'))
+            if anchor_name:
+                self.cmb_anchor.setEditText(anchor_name)
+
+            anchor_follow = to_bool(settings.value('templates/anchor_follow'))
+            if anchor_follow is not None:
+                self.chk_anchor.setChecked(anchor_follow)
+        finally:
+            for w, prev in blocked:
+                w.blockSignals(prev)
+
+        controls_visible = to_bool(settings.value('panels/controls_visible'))
+        if controls_visible is not None:
+            self.controlsPanelAction.blockSignals(True)
+            self.controlsPanelAction.setChecked(controls_visible)
+            self.controlsPanelAction.blockSignals(False)
+            self.controlsPanel.setVisible(controls_visible)
+
+        results_visible = to_bool(settings.value('panels/results_visible'))
+        if results_visible is not None:
+            self.resultsDock.setVisible(results_visible)
+
+        camera_visible = to_bool(settings.value('panels/camera_visible'))
+        if camera_visible is not None:
+            self.cameraDock.setVisible(camera_visible)
+
+        scroll_val = to_int(settings.value('panels/controls_scroll'))
+        if scroll_val is not None:
+            self.controlsPanel.verticalScrollBar().setValue(scroll_val)
+
+        cam_json = to_str(settings.value('camera/state'))
+        if cam_json:
+            try:
+                cam_state = json.loads(cam_json)
+            except Exception:
+                cam_state = None
+            if isinstance(cam_state, dict):
+                self.cam_panel.apply_state(cam_state)
+
+        logs_json = to_str(settings.value('logs/history'))
+        self._log_buffer = []
+        if logs_json:
+            try:
+                entries = json.loads(logs_json)
+            except Exception:
+                entries = []
+            if isinstance(entries, list):
+                for entry in entries[-50:]:
+                    if isinstance(entry, str):
+                        self._log_buffer.append(entry)
+        if self._log_buffer:
+            self.txt_log.clear()
+            for entry in self._log_buffer:
+                self.txt_log.append(entry)
+
+    def _save_settings(self):
+        settings = self._settings
+        try:
+            settings.setValue('window/geometry', bytes(self.saveGeometry().toHex()).decode('ascii'))
+        except Exception:
+            pass
+        try:
+            settings.setValue('window/state', bytes(self.saveState().toHex()).decode('ascii'))
+        except Exception:
+            pass
+        settings.setValue('connection/host', self.ed_host.text())
+        settings.setValue('mode/current', 'trigger' if self.rad_trig.isChecked() else 'training')
+        settings.setValue('processing/proc_width', self.cmb_w.currentText())
+        settings.setValue('processing/detect_every', int(self.sp_every.value()))
+        settings.setValue('templates/slot_index', int(self.cmb_slot.currentIndex()))
+        settings.setValue('templates/name', self.ed_name.text())
+        settings.setValue('templates/max', int(self.sp_max.value()))
+        settings.setValue('templates/enabled', bool(self.chk_en.isChecked()))
+        settings.setValue('templates/anchor', self.cmb_anchor.currentText())
+        settings.setValue('templates/anchor_follow', bool(self.chk_anchor.isChecked()))
+        settings.setValue('panels/controls_visible', bool(self.controlsPanel.isVisible()))
+        settings.setValue('panels/results_visible', bool(self.resultsDock.isVisible()))
+        settings.setValue('panels/camera_visible', bool(self.cameraDock.isVisible()))
+        settings.setValue('panels/controls_scroll', int(self.controlsPanel.verticalScrollBar().value()))
+        settings.setValue('camera/state', json.dumps(self.cam_panel.get_state()))
+        settings.setValue('logs/history', json.dumps(self._log_buffer[-50:]))
+        settings.sync()
+
     # ---- websocket handlers ----
+
     def _ws_ok(self):
         self.btn_conn.setEnabled(False); self.btn_disc.setEnabled(True); self._ping.start()
         self._send({"type":"set_mode","mode":"training" if self.rad_train.isChecked() else "trigger"})
@@ -365,7 +681,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _append_log(self, text: str):
         ts = time.strftime("%H:%M:%S")
-        self.txt_log.append(f"[{ts}] {text}")
+        entry = f"[{ts}] {text}"
+        self._log_buffer.append(entry)
+        if len(self._log_buffer) > 50:
+            self._log_buffer = self._log_buffer[-50:]
+        self.txt_log.append(entry)
 
     def _ws_txt(self,txt:str):
         try: msg=json.loads(txt); t=msg.get("type","")
