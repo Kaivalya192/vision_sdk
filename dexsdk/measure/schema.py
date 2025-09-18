@@ -1,6 +1,26 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
+from typing import Literal
+
+
+MeasurementKind = Literal["edge", "distance", "angle", "circle_radius"]
+
+
+class MeasureJob(TypedDict, total=False):
+    tool: MeasurementKind  # required
+    roiA_poly: List[List[float]]  # required for all tools
+    roiB_poly: List[List[float]]  # required for distance/angle
+    mm_per_px: float | List[float]
+    anchor: bool
+    anchor_object: str
+    id: str
+
+
+class MeasuresPacket(TypedDict, total=False):
+    units: Literal["mm", "px"]
+    measures: List[Dict[str, Any]]
+    overlay_jpeg_b64: str
 
 
 def _ensure_meta(meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -65,3 +85,11 @@ def make_result(
         "primitives": {} if primitives is None else dict(primitives),
     }
 
+
+__all__ = [
+    "MeasurementKind",
+    "MeasureJob",
+    "MeasuresPacket",
+    "make_measure",
+    "make_result",
+]

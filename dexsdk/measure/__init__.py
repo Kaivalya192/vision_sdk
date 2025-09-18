@@ -16,6 +16,7 @@ from .core import (
 )
 from .schema import make_result, make_measure
 from .geometry import PointPick, LineFit, DistanceP2P  # noqa: F401
+from . import tools  # noqa: F401
 
 # Bind default tools into registry
 register("point_pick", PointPick)
@@ -31,4 +32,5 @@ __all__ = [
     "registry_names",
     "make_result",
     "make_measure",
+    "tools",
 ]

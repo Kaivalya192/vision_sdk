@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Measurement dispatch for ROI-based tools."""
+
+from __future__ import annotations
+
+import base64
+from typing import Any, Dict, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+
+from dexsdk.measure.schema import MeasureJob, MeasuresPacket, MeasurementKind
+from dexsdk.measure.tools import (
+    EdgeFeature,
+    CircleFeature,
+    angle_between_edges_deg,
+    circle_radius_in_roi,
+    distance_between_edges_mm,
+    edge_feature_from_roi,
+)
+
+try:  # Optional dependency; not all deployments package calibration helpers.
+    from dexsdk.calib import store as calib_store  # type: ignore
+except Exception:  # pragma: no cover - best effort import
+    calib_store = None
+
+DEFAULT_MM_PER_PX: Tuple[float, float] = (0.05, 0.05)
+
+
+def _maybe_fetch_calib_info(calib_info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if calib_info:
+        return calib_info
+    if calib_store is None:
+        return None
+    candidate_attrs = (
+        "get_cached_plane_scale",
+        "get_cached_calib_info",
+        "get_cached",
+        "get_latest",
+        "load_cached",
+    )
+    for name in candidate_attrs:
+        fn = getattr(calib_store, name, None)
+        if callable(fn):
+            try:
+                data = fn()
+            except TypeError:
+                try:
+                    data = fn(None)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if data:
+                return data
+    return None
+
+
+def _scale_from_info(info: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    plane = info
+    if isinstance(info, dict) and isinstance(info.get("plane_scale"), dict):
+        plane = info["plane_scale"]
+    if not isinstance(plane, dict):
+        return None
+    mm_x = plane.get("mm_per_px_x")
+    mm_y = plane.get("mm_per_px_y")
+    if mm_x and mm_y:
+        mm_x = float(mm_x)
+        mm_y = float(mm_y)
+        if mm_x > 0 and mm_y > 0:
+            return mm_x, mm_y
+    px_x = plane.get("px_per_mm_x")
+    px_y = plane.get("px_per_mm_y")
+    if px_x and px_y:
+        px_x = float(px_x)
+        px_y = float(px_y)
+        if px_x > 0 and px_y > 0:
+            return 1.0 / px_x, 1.0 / px_y
+    scalar = plane.get("mm_per_px")
+    if isinstance(scalar, (int, float)) and scalar > 0:
+        return float(scalar), float(scalar)
+    return None
+
+
+def _normalize_mm_per_px(value: Any) -> Tuple[float, float]:
+    if isinstance(value, (list, tuple, np.ndarray)):
+        seq = list(value)
+        if len(seq) >= 2:
+            sx = float(seq[0])
+            sy = float(seq[1])
+            if sx > 0 and sy > 0:
+                return sx, sy
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError):
+        pass
+    else:
+        if scalar > 0:
+            return scalar, scalar
+    raise ValueError("mm_per_px must be a positive float or a length-2 sequence")
+
+
+def _resolve_mm_per_px(job: Dict[str, Any], calib_info: Optional[Dict[str, Any]]) -> Tuple[float, float]:
+    if "mm_per_px" in job and job["mm_per_px"] is not None:
+        return _normalize_mm_per_px(job["mm_per_px"])
+    info = _maybe_fetch_calib_info(calib_info)
+    if isinstance(info, dict):
+        scale = _scale_from_info(info)
+        if scale:
+            return scale
+    return DEFAULT_MM_PER_PX
+
+
+def _rect_to_quad(rect: Sequence[float]) -> np.ndarray:
+    x, y, w, h = [float(rect[i]) for i in range(4)]
+    return np.array(
+        [[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
+        dtype=np.float32,
+    )
+
+
+def _as_quad(value: Any, name: str) -> np.ndarray:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 3 and arr.shape[0] == 1 and arr.shape[1] == 4 and arr.shape[2] == 2:
+        arr = arr.reshape(4, 2)
+    if arr.shape == (4, 2):
+        return arr.copy()
+    flat = arr.reshape(-1)
+    if flat.size == 4:
+        return _rect_to_quad(flat)
+    raise ValueError(f"{name} must be a 4x2 polygon or [x,y,w,h]")
+
+
+def _extract_roi(job: Dict[str, Any], primary: str, fallbacks: Sequence[str]) -> Optional[np.ndarray]:
+    keys = (primary,) + tuple(fallbacks)
+    for key in keys:
+        if key in job and job[key] is not None:
+            try:
+                return _as_quad(job[key], key)
+            except ValueError:
+                continue
+    return None
+
+
+def _apply_anchor(poly: np.ndarray, job: Dict[str, Any], last_detections: Optional[Dict[str, Dict[str, Any]]]) -> np.ndarray:
+    if not job.get("anchor"):
+        return poly
+    name = job.get("anchor_object")
+    if not name or not last_detections:
+        return poly
+    det = last_detections.get(name)
+    if not det:
+        return poly
+    H = det.get("H_template_to_frame")
+    if H is None:
+        return poly
+    H_arr = np.asarray(H, dtype=np.float32)
+    if H_arr.size != 9:
+        return poly
+    H_arr = H_arr.reshape(3, 3)
+    try:
+        warped = cv2.perspectiveTransform(poly.reshape(-1, 1, 2).astype(np.float32), H_arr)
+    except cv2.error:
+        return poly
+    return warped.reshape(-1, 2)
+
+
+def _clip_point(pt: np.ndarray, width: int, height: int) -> np.ndarray:
+    return np.array([
+        float(np.clip(pt[0], 0, max(0, width - 1))),
+        float(np.clip(pt[1], 0, max(0, height - 1))),
+    ])
+
+
+def _line_points(feature: EdgeFeature, shape: Tuple[int, ...]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    height, width = shape[:2]
+    span = float(max(width, height))
+    p0 = np.array(feature.point_xy, dtype=np.float64)
+    direction = np.array(feature.dir_xy, dtype=np.float64)
+    p1 = p0 - direction * span
+    p2 = p0 + direction * span
+    p1 = _clip_point(p1, width, height)
+    p2 = _clip_point(p2, width, height)
+    return (int(round(p1[0])), int(round(p1[1]))), (int(round(p2[0])), int(round(p2[1])))
+
+
+def _draw_roi(image: np.ndarray, poly: np.ndarray, color: Tuple[int, int, int]) -> None:
+    pts = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(image, [pts], True, color, 2, cv2.LINE_AA)
+
+
+def _draw_edge(image: np.ndarray, feature: EdgeFeature, color: Tuple[int, int, int]) -> None:
+    p1, p2 = _line_points(feature, image.shape)
+    cv2.line(image, p1, p2, color, 2, cv2.LINE_AA)
+
+
+def _draw_circle(image: np.ndarray, feature: CircleFeature, color: Tuple[int, int, int]) -> None:
+    center = (int(round(feature.center_xy[0])), int(round(feature.center_xy[1])))
+    radius = max(1, int(round(feature.radius_px)))
+    cv2.circle(image, center, radius, color, 2, cv2.LINE_AA)
+    cv2.drawMarker(image, center, color, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+
+
+def _encode_overlay(image: np.ndarray) -> str:
+    ok, buffer = cv2.imencode(".jpg", image)
+    if not ok:
+        raise RuntimeError("Failed to encode overlay image")
+    return base64.b64encode(buffer.tobytes()).decode("ascii")
+
+
+def run_measure_on_frame(
+    frame_bgr: np.ndarray,
+    job: MeasureJob,
+    last_detections: Optional[Dict[str, Dict[str, Any]]],
+    calib_info: Optional[Dict[str, Any]],
+) -> Tuple[MeasuresPacket, np.ndarray]:
+    """Execute a measurement within provided ROI polygons."""
+
+    if frame_bgr is None or frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
+        raise ValueError("frame_bgr must be an HxWx3 BGR image")
+
+    job_dict: Dict[str, Any] = dict(job or {})
+    tool = str(job_dict.get("tool") or job_dict.get("type") or "").lower()
+    if tool not in {"edge", "distance", "angle", "circle_radius"}:
+        raise ValueError(f"Unsupported measurement tool: {tool}")
+
+    roi_a = _extract_roi(job_dict, "roiA_poly", ("roiA", "roi"))
+    if roi_a is None:
+        raise ValueError("roiA_poly is required")
+    roi_b = None
+    if tool in {"distance", "angle"}:
+        roi_b = _extract_roi(job_dict, "roiB_poly", ("roiB",))
+        if roi_b is None:
+            raise ValueError("roiB_poly is required for distance/angle tools")
+
+    mm_per_px = _resolve_mm_per_px(job_dict, calib_info)
+    last_detections = last_detections or {}
+    roi_a = _apply_anchor(roi_a, job_dict, last_detections)
+    if roi_b is not None:
+        roi_b = _apply_anchor(roi_b, job_dict, last_detections)
+
+    roi_a_np = roi_a.astype(np.float32)
+    roi_b_np = roi_b.astype(np.float32) if roi_b is not None else None
+
+    overlay = frame_bgr.copy()
+    _draw_roi(overlay, roi_a_np, (0, 200, 255))
+    if roi_b_np is not None:
+        _draw_roi(overlay, roi_b_np, (80, 255, 80))
+
+    measure_id = str(job_dict.get("id") or "m1")
+    measure_entry: Dict[str, Any]
+
+    if tool == "edge":
+        edge_feature = edge_feature_from_roi(frame_bgr, roi_a_np)
+        _draw_edge(overlay, edge_feature, (0, 0, 255))
+        measure_entry = {
+            "id": measure_id,
+            "kind": tool,
+            "value": float(edge_feature.theta_deg),
+            "units": "deg",
+            "meta": {
+                "point_xy": [float(edge_feature.point_xy[0]), float(edge_feature.point_xy[1])],
+                "dir_xy": [float(edge_feature.dir_xy[0]), float(edge_feature.dir_xy[1])],
+                "n_samples": int(edge_feature.n_samples),
+                "rmse_px": float(edge_feature.inlier_rmse_px),
+            },
+        }
+        packet_units = "mm"
+    elif tool == "distance":
+        edge_a = edge_feature_from_roi(frame_bgr, roi_a_np)
+        edge_b = edge_feature_from_roi(frame_bgr, roi_b_np)  # type: ignore[arg-type]
+        _draw_edge(overlay, edge_a, (0, 0, 255))
+        _draw_edge(overlay, edge_b, (255, 0, 0))
+        distance_mm = float(distance_between_edges_mm(edge_a, edge_b, mm_per_px))
+        measure_entry = {
+            "id": measure_id,
+            "kind": tool,
+            "value": distance_mm,
+            "units": "mm",
+            "meta": {
+                "edgeA": {
+                    "theta_deg": float(edge_a.theta_deg),
+                    "rmse_px": float(edge_a.inlier_rmse_px),
+                },
+                "edgeB": {
+                    "theta_deg": float(edge_b.theta_deg),
+                    "rmse_px": float(edge_b.inlier_rmse_px),
+                },
+                "mm_per_px": [float(mm_per_px[0]), float(mm_per_px[1])],
+            },
+        }
+        packet_units = "mm"
+    elif tool == "angle":
+        edge_a = edge_feature_from_roi(frame_bgr, roi_a_np)
+        edge_b = edge_feature_from_roi(frame_bgr, roi_b_np)  # type: ignore[arg-type]
+        _draw_edge(overlay, edge_a, (0, 0, 255))
+        _draw_edge(overlay, edge_b, (255, 0, 0))
+        angle_deg = float(angle_between_edges_deg(edge_a, edge_b))
+        measure_entry = {
+            "id": measure_id,
+            "kind": tool,
+            "value": angle_deg,
+            "units": "deg",
+            "meta": {
+                "edgeA": {
+                    "theta_deg": float(edge_a.theta_deg),
+                    "rmse_px": float(edge_a.inlier_rmse_px),
+                },
+                "edgeB": {
+                    "theta_deg": float(edge_b.theta_deg),
+                    "rmse_px": float(edge_b.inlier_rmse_px),
+                },
+            },
+        }
+        packet_units = None
+    else:  # circle_radius
+        circle_feature = circle_radius_in_roi(frame_bgr, roi_a_np, mm_per_px)
+        if circle_feature is None:
+            measure_entry = {
+                "id": measure_id,
+                "kind": tool,
+                "value": float("nan"),
+                "units": "mm",
+                "meta": {
+                    "ok": False,
+                    "reason": "insufficient_edge_points",
+                },
+            }
+        else:
+            _draw_circle(overlay, circle_feature, (255, 128, 0))
+            measure_entry = {
+                "id": measure_id,
+                "kind": tool,
+                "value": float(circle_feature.radius_mm),
+                "units": "mm",
+                "meta": {
+                    "center_xy": [float(circle_feature.center_xy[0]), float(circle_feature.center_xy[1])],
+                    "radius_px": float(circle_feature.radius_px),
+                    "n_inliers": int(circle_feature.n_inliers),
+                },
+            }
+        packet_units = "mm"
+
+    overlay_b64 = _encode_overlay(overlay)
+    packet: MeasuresPacket = {
+        "measures": [measure_entry],
+        "overlay_jpeg_b64": overlay_b64,
+    }
+    if packet_units == "mm":
+        packet["units"] = "mm"
+
+    return packet, overlay
+

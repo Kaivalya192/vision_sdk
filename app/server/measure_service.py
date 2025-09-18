@@ -1,178 +1,246 @@
+#!/usr/bin/env python3
+"""ROI measurement service wrapper.
+
+This module exposes a single function `run_measure_on_frame` that:
+- resolves scale from job or calibration info,
+- normalizes and optionally anchors ROI polygons,
+- dispatches to measurement tools in `dexsdk.measure.tools`,
+- renders an overlay and returns a MeasuresPacket dict and overlay image.
+"""
+
 from __future__ import annotations
 
-import math
-from typing import Any, Dict, Optional, Tuple, Callable
+import base64
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-from dexsdk.measure.core import MeasureContext
-from dexsdk.measure.geometry import DistanceP2P, LineFit, PointPick
-from dexsdk.measure.schema import make_measure, make_result
-from .calib_io import load_k_json
+from dexsdk.measure.tools import (
+    edge_feature_from_roi,
+    distance_between_edges_mm,
+    angle_between_edges_deg,
+    circle_radius_in_roi,
+)
+
+try:
+    from dexsdk.calib import store as calib_store  # optional
+except Exception:  # pragma: no cover
+    calib_store = None  # type: ignore
 
 
-class AnchorHelper:
-    def __init__(self):
-        self.origin_pose: Optional[Dict[str, float]] = None
-        self.current_pose: Optional[Dict[str, float]] = None
-        self.base_rect: Optional[Tuple[int, int, int, int]] = None
-
-    def set_origin(self, pose: Dict[str, float], base_rect: Tuple[int, int, int, int]) -> None:
-        self.origin_pose = {
-            "x": float(pose.get("x", 0.0)),
-            "y": float(pose.get("y", 0.0)),
-            "theta_deg": float(pose.get("theta_deg", 0.0)),
-        }
-        self.base_rect = (int(base_rect[0]), int(base_rect[1]), int(base_rect[2]), int(base_rect[3]))
-        self.current_pose = dict(self.origin_pose)
-
-    def reset_origin(self) -> None:
-        self.origin_pose = None
-        self.base_rect = None
-
-    def update(self, pose: Dict[str, float]) -> None:
-        self.current_pose = {
-            "x": float(pose.get("x", 0.0)),
-            "y": float(pose.get("y", 0.0)),
-            "theta_deg": float(pose.get("theta_deg", 0.0)),
-        }
-
-    def warp_rect(self, rect: Tuple[int, int, int, int], img_w: int, img_h: int) -> Tuple[int, int, int, int]:
-        if not self.origin_pose or not self.current_pose:
-            return rect
-        x, y, w, h = rect
-        cx, cy = x + 0.5 * w, y + 0.5 * h
-        dth = math.radians(self.current_pose["theta_deg"] - self.origin_pose["theta_deg"])
-        dx = self.current_pose["x"] - self.origin_pose["x"]
-        dy = self.current_pose["y"] - self.origin_pose["y"]
-        # rotate center around itself (no-op), then translate by (dx,dy)
-        rcx = cx * math.cos(dth) - cy * math.sin(dth)
-        rcy = cx * math.sin(dth) + cy * math.cos(dth)
-        ncx, ncy = rcx + dx, rcy + dy
-        nx = int(round(ncx - 0.5 * w)); ny = int(round(ncy - 0.5 * h))
-        nx = max(0, min(int(img_w - 1), nx))
-        ny = max(0, min(int(img_h - 1), ny))
-        nw = max(1, min(int(img_w - nx), int(w)))
-        nh = max(1, min(int(img_h - ny), int(h)))
-        return nx, ny, nw, nh
+DEFAULT_MM_PER_PX: Tuple[float, float] = (0.05, 0.05)
 
 
-def make_get_mm_scale_fn(path: str = "~/.vision_sdk/K.json") -> Callable[[], Tuple[Tuple[float, float], str]]:
-    def _fn() -> Tuple[Tuple[float, float], str]:
-        data = load_k_json(path) or {}
-        try:
-            ps = data.get("plane_scale") or {}
-            sx = float(ps.get("mm_per_px_x"))
-            sy = float(ps.get("mm_per_px_y"))
-            if sx > 0 and sy > 0:
-                return (sx, sy), "mm"
-        except Exception:
-            pass
-        return (1.0, 1.0), "px"
+def _scale_from_calib_info(info: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    # Accept either plane dict directly or nested under "plane_scale"
+    plane = info.get("plane_scale", info)
+    if not isinstance(plane, dict):
+        return None
+    mmx = plane.get("mm_per_px_x")
+    mmy = plane.get("mm_per_px_y")
+    if mmx and mmy and float(mmx) > 0 and float(mmy) > 0:
+        return float(mmx), float(mmy)
+    pxx = plane.get("px_per_mm_x")
+    pxy = plane.get("px_per_mm_y")
+    if pxx and pxy and float(pxx) > 0 and float(pxy) > 0:
+        return 1.0 / float(pxx), 1.0 / float(pxy)
+    scalar = plane.get("mm_per_px")
+    if isinstance(scalar, (int, float)) and scalar > 0:
+        return float(scalar), float(scalar)
+    return None
 
-    return _fn
+
+def _normalize_mm_per_px(val: Any) -> Tuple[float, float]:
+    if isinstance(val, (list, tuple, np.ndarray)) and len(val) >= 2:
+        sx = float(val[0])
+        sy = float(val[1])
+        if sx > 0 and sy > 0:
+            return sx, sy
+    try:
+        f = float(val)
+        if f > 0:
+            return f, f
+    except Exception:
+        pass
+    raise ValueError("mm_per_px must be > 0 (scalar or length-2)")
 
 
-class MeasureService:
-    def __init__(self, get_mm_scale_fn):
-        """get_mm_scale_fn -> (sx, sy), units("mm"|"px")"""
-        self.get_mm_scale_fn = get_mm_scale_fn
+def _resolve_mm_per_px(job: Dict[str, Any], calib_info: Optional[Dict[str, Any]]) -> Tuple[float, float]:
+    if job.get("mm_per_px") is not None:
+        return _normalize_mm_per_px(job["mm_per_px"])
+    if isinstance(calib_info, dict):
+        s = _scale_from_calib_info(calib_info)
+        if s:
+            return s
+    # best-effort: attempt to load via calib store if it offers a function
+    if calib_store is not None:
+        for name in ("load_json", "get_cached", "get_latest"):
+            fn = getattr(calib_store, name, None)
+            try:
+                if callable(fn):
+                    data = fn("plane_scale.json") if name == "load_json" else fn()
+                    if isinstance(data, dict):
+                        s = _scale_from_calib_info(data)
+                        if s:
+                            return s
+            except Exception:
+                continue
+    return DEFAULT_MM_PER_PX
 
-    def _ctx(self) -> MeasureContext:
-        (sx, sy), units = self.get_mm_scale_fn()
-        return MeasureContext(scale=(float(sx), float(sy)), units=str(units))
 
-    def _draw_cross(self, img: np.ndarray, pt: Tuple[float, float], color=(0, 255, 255)):
-        x, y = int(round(pt[0])), int(round(pt[1]))
-        cv2.drawMarker(img, (x, y), color, markerType=cv2.MARKER_CROSS, markerSize=14, thickness=2, line_type=cv2.LINE_AA)
+def _rect_to_quad(rect: Sequence[float]) -> np.ndarray:
+    x, y, w, h = [float(rect[i]) for i in range(4)]
+    return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32)
 
-    def _draw_line_seg(self, img: np.ndarray, p1: Tuple[float, float], p2: Tuple[float, float], color=(0, 255, 0)):
-        cv2.line(img, (int(round(p1[0])), int(round(p1[1]))), (int(round(p2[0])), int(round(p2[1]))), color, 2, cv2.LINE_AA)
 
-    def run_job(self, image_bgr: np.ndarray, job: Dict[str, Any]) -> Tuple[Dict[str, Any], np.ndarray]:
-        tool = str(job.get("tool", "")).lower()
-        params = dict(job.get("params", {}))
-        roi = job.get("roi")
-        if roi is not None:
-            x, y, w, h = [int(v) for v in roi]
+def _as_quad(value: Any, name: str) -> np.ndarray:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 3 and arr.shape[:2] == (1, 4) and arr.shape[2] == 2:
+        arr = arr.reshape(4, 2)
+    if arr.shape == (4, 2):
+        return arr
+    if arr.size == 4:
+        return _rect_to_quad(arr.ravel().tolist())
+    raise ValueError(f"{name} must be a 4x2 polygon or legacy [x,y,w,h]")
+
+
+def _extract_roi(job: Dict[str, Any], key_poly: str, legacy_keys: Sequence[str]) -> Optional[np.ndarray]:
+    if job.get(key_poly) is not None:
+        return _as_quad(job[key_poly], key_poly)
+    for k in legacy_keys:
+        if job.get(k) is not None:
+            return _as_quad(job[k], k)
+    return None
+
+
+def _apply_anchor(roi_xy: np.ndarray, job: Dict[str, Any], detections: Dict[str, Any]) -> np.ndarray:
+    if not job.get("anchor"):
+        return roi_xy
+    anchor_obj = job.get("anchor_object") or job.get("anchorId")
+    det = None
+    if isinstance(detections, dict) and anchor_obj is not None:
+        det = detections.get(str(anchor_obj))
+    if not isinstance(det, dict):
+        return roi_xy
+    H = det.get("H_template_to_frame") or det.get("H")
+    if H is None:
+        return roi_xy
+    H = np.asarray(H, dtype=np.float64).reshape(3, 3)
+    pts = roi_xy.reshape(-1, 1, 2).astype(np.float32)
+    warped = cv2.perspectiveTransform(pts, H).reshape(4, 2)
+    return warped.astype(np.float32)
+
+
+def _draw_roi(img: np.ndarray, poly: np.ndarray, color: tuple[int, int, int]) -> None:
+    pts = poly.reshape(-1, 1, 2).astype(np.int32)
+    cv2.polylines(img, [pts], True, color, 1, lineType=cv2.LINE_AA)
+
+
+def _draw_edge(img: np.ndarray, edge, color: tuple[int, int, int]) -> None:
+    p = np.array(edge.point_xy, dtype=np.float32)
+    d = np.array(edge.dir_xy, dtype=np.float32)
+    h, w = img.shape[:2]
+    t = np.array([-2000.0, 2000.0], dtype=np.float32)
+    pts = (p[None, :] + t[:, None] * d[None, :]).clip([0, 0], [w - 1, h - 1]).astype(np.int32)
+    cv2.line(img, tuple(pts[0]), tuple(pts[1]), color, 2, lineType=cv2.LINE_AA)
+
+
+def _draw_circle(img: np.ndarray, circle, color: tuple[int, int, int]) -> None:
+    c = (int(round(circle.center_xy[0])), int(round(circle.center_xy[1])))
+    cv2.circle(img, c, int(round(circle.radius_px)), color, 2, lineType=cv2.LINE_AA)
+    cv2.circle(img, c, 2, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+
+def _encode_overlay(img_bgr: np.ndarray) -> str:
+    ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        ok, buf = cv2.imencode(".png", img_bgr)
+    return base64.b64encode(buf).decode("ascii")
+
+
+def run_measure_on_frame(
+    frame_bgr: np.ndarray,
+    job: Dict[str, Any],
+    last_detections: Optional[Dict[str, Any]],
+    calib_info: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], np.ndarray]:
+    """Returns (packet: MeasuresPacket, overlay_bgr)."""
+
+    job_dict = dict(job or {})
+    tool = str(job_dict.get("tool") or job_dict.get("kind") or "edge").lower()
+    if tool not in {"edge", "distance", "angle", "circle_radius"}:
+        raise ValueError(f"Unsupported measurement tool: {tool}")
+
+    # ROIs
+    roi_a = _extract_roi(job_dict, "roiA_poly", ("roiA", "roi"))
+    if roi_a is None:
+        raise ValueError("roiA_poly is required")
+    roi_b = None
+    if tool in {"distance", "angle"}:
+        roi_b = _extract_roi(job_dict, "roiB_poly", ("roiB",))
+        if roi_b is None:
+            raise ValueError("roiB_poly is required for distance/angle tools")
+
+    # Scale
+    mm_per_px = _resolve_mm_per_px(job_dict, calib_info)
+
+    # Anchor transform if present
+    detections = last_detections or {}
+    roi_a = _apply_anchor(roi_a, job_dict, detections)
+    if roi_b is not None:
+        roi_b = _apply_anchor(roi_b, job_dict, detections)
+
+    roi_a = roi_a.astype(np.float32)
+    roi_b = roi_b.astype(np.float32) if roi_b is not None else None
+
+    # Overlay base and ROI drawing
+    overlay = frame_bgr.copy()
+    _draw_roi(overlay, roi_a, (0, 200, 255))
+    if roi_b is not None:
+        _draw_roi(overlay, roi_b, (80, 255, 80))
+
+    measure_id = str(job_dict.get("id") or "m1")
+    entry: Dict[str, Any]
+    packet_units: Optional[str]
+
+    if tool == "edge":
+        edge = edge_feature_from_roi(frame_bgr, roi_a)
+        _draw_edge(overlay, edge, (0, 0, 255))
+        entry = {"id": measure_id, "kind": tool, "value": float(edge.theta_deg), "units": "deg"}
+        packet_units = "mm"
+    elif tool == "distance":
+        ea = edge_feature_from_roi(frame_bgr, roi_a)
+        eb = edge_feature_from_roi(frame_bgr, roi_b)  # type: ignore[arg-type]
+        _draw_edge(overlay, ea, (0, 0, 255))
+        _draw_edge(overlay, eb, (255, 0, 0))
+        dist_mm = float(distance_between_edges_mm(ea, eb, mm_per_px))
+        entry = {"id": measure_id, "kind": tool, "value": dist_mm, "units": "mm"}
+        packet_units = "mm"
+    elif tool == "angle":
+        ea = edge_feature_from_roi(frame_bgr, roi_a)
+        eb = edge_feature_from_roi(frame_bgr, roi_b)  # type: ignore[arg-type]
+        _draw_edge(overlay, ea, (0, 0, 255))
+        _draw_edge(overlay, eb, (255, 0, 0))
+        ang = float(angle_between_edges_deg(ea, eb))
+        entry = {"id": measure_id, "kind": tool, "value": ang, "units": "deg"}
+        packet_units = None
+    else:  # circle_radius
+        circle = circle_radius_in_roi(frame_bgr, roi_a, mm_per_px)
+        if circle is not None:
+            _draw_circle(overlay, circle, (255, 128, 0))
+            entry = {"id": measure_id, "kind": tool, "value": float(circle.radius_mm), "units": "mm"}
         else:
-            x, y, w, h = 0, 0, int(image_bgr.shape[1]), int(image_bgr.shape[0])
+            entry = {"id": measure_id, "kind": tool, "value": float("nan"), "units": "mm"}
+        packet_units = "mm"
 
-        ctx = self._ctx()
-        overlay = image_bgr.copy()
-        measures = []
-        prim = {"points": [], "lines": []}
+    packet: Dict[str, Any] = {
+        "measures": [entry],
+        "overlay_jpeg_b64": _encode_overlay(overlay),
+    }
+    if packet_units == "mm":
+        packet["units"] = "mm"
 
-        if tool == "point_pick":
-            hint = params.get("hint_xy")
-            res = PointPick().run(ctx, image_bgr, roi=(x, y, w, h), hint_xy=tuple(hint) if hint else None)
-            px = res.get("point_px", [x + w * 0.5, y + h * 0.5])
-            self._draw_cross(overlay, (px[0], px[1]))
-            measures.append(
-                make_measure(id="point_pick", kind="point_pick", value=0.0, passed=True, meta={"point_px": px, "point_mm": res.get("point_mm")})
-            )
-            prim["points"].append(px)
-
-        elif tool == "line_fit":
-            res = LineFit().run(ctx, image_bgr, roi=(x, y, w, h))
-            if res:
-                a, b, c = res["line"]
-                p1, p2 = res["endpoints_px"][0], res["endpoints_px"][1]
-                self._draw_line_seg(overlay, p1, p2, color=(0, 255, 0))
-                txt = f"{res['angle_deg']:.1f} deg"
-                cv2.putText(overlay, txt, (int(p1[0]), int(p1[1]) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-                measures.append(
-                    make_measure(
-                        id="line_fit", kind="angle_deg", value=float(res["angle_deg"]), sigma=None, passed=True, meta={"line_abc": [a, b, c], "span_mm": res["span_mm"]}
-                    )
-                )
-                prim["lines"].append([p1, p2])
-
-        elif tool == "distance_p2p":
-            p1 = tuple(params.get("p1", [x + w * 0.25, y + h * 0.5]))
-            p2 = tuple(params.get("p2", [x + w * 0.75, y + h * 0.5]))
-            res = DistanceP2P().run(ctx, image_bgr, roi=(x, y, w, h), p1=p1, p2=p2)
-            self._draw_line_seg(overlay, p1, p2, color=(0, 200, 255))
-            d = float(res.get("distance_mm" if ctx.units == "mm" else "distance_px", 0.0))
-            lbl = f"{d:.3f} {ctx.units}"
-            mpt = (0.5 * (p1[0] + p2[0]), 0.5 * (p1[1] + p2[1]))
-            cv2.putText(overlay, lbl, (int(mpt[0]), int(mpt[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
-            measures.append(
-                make_measure(id="distance_p2p", kind="distance_p2p", value=d, sigma=None, passed=True, meta={"p1_px": list(p1), "p2_px": list(p2)})
-            )
-            prim["points"].extend([list(p1), list(p2)])
-            prim["lines"].append([list(p1), list(p2)])
-
-        elif tool == "distance_p2l":
-            # params: pt [x,y], line [a,b,c]
-            pt = params.get("pt") or [x + w * 0.5, y + h * 0.5]
-            line = params.get("line")  # try ROI fit if absent
-            if line is None:
-                lres = LineFit().run(ctx, image_bgr, roi=(x, y, w, h))
-                line = lres.get("line") if lres else [0.0, 1.0, -float(y + h * 0.5)]
-            a, b, c = [float(v) for v in line]
-            px, py = float(pt[0]), float(pt[1])
-            denom = math.hypot(a, b) or 1.0
-            d_px = abs(a * px + b * py + c) / denom
-            d_val = ctx.px_len_to_mm(d_px, axis="avg") if ctx.units == "mm" else d_px
-            # perpendicular foot
-            # line normal: n = (a,b), point projection onto line
-            # foot = p - ((a*px+b*py+c)/(a^2+b^2)) * (a,b)
-            t = (a * px + b * py + c) / (a * a + b * b)
-            qx, qy = px - a * t, py - b * t
-            self._draw_line_seg(overlay, (px, py), (qx, qy), color=(255, 200, 0))
-            self._draw_cross(overlay, (px, py), color=(255, 200, 0))
-            lbl = f"{d_val:.3f} {ctx.units}"
-            cv2.putText(overlay, lbl, (int(qx), int(qy) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2, cv2.LINE_AA)
-            measures.append(
-                make_measure(id="distance_p2l", kind="distance_p2l", value=float(d_val), sigma=None, passed=True, meta={"pt_px": [px, py], "line": [a, b, c]})
-            )
-            prim["points"].append([px, py])
-            prim["lines"].append([[px, py], [qx, qy]])
-
-        else:
-            measures.append(make_measure(id="unknown", kind=tool or "unknown", value=0.0, passed=False, meta={"error": "unsupported tool"}))
-
-        packet = make_result(units=ctx.units, measures=measures, primitives=prim)
-        return packet, overlay
+    return packet, overlay
