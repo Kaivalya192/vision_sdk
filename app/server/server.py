@@ -107,6 +107,11 @@ class VisionServer:
             self.publish_every = max(1, int(msg.get("n", DEFAULT_PUBLISH_EVERY)))
             await r.send_acked(ws, msg)
 
+        async def h_set_detection_params(ws, msg: WSMessage):
+            params = msg.get("params", {})
+            applied = self.detect.update_params(params)
+            await r.send_acked(ws, msg, extra={"params": applied})
+
         async def h_set_params(ws, msg: WSMessage):
             p = msg.get("params", {})
             # apply camera parameters (same as monolith)
@@ -238,6 +243,7 @@ class VisionServer:
         r.register("trigger", h_trigger)
         r.register("set_proc_width", h_set_proc_width)
         r.register("set_publish_every", h_set_publish_every)
+        r.register("set_detection_params", h_set_detection_params)
         r.register("set_params", h_set_params)
         r.register("set_view", h_set_view)
         r.register("add_template_rect", h_add_template_rect)

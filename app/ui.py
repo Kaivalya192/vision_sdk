@@ -97,7 +97,6 @@ class VideoLabel(QtWidgets.QLabel):
             self.polygonSelected.emit(list(self._poly_pts))
         self._poly_pts.clear(); self._poly_mode=False; self.update()
 
-
 class CameraPanel(QtWidgets.QWidget):
     paramsChanged      = QtCore.pyqtSignal(dict)
     viewChanged        = QtCore.pyqtSignal(dict)
@@ -198,8 +197,6 @@ class CameraPanel(QtWidgets.QWidget):
 
 
         self.blockSignals(False); self._emit_params(); self._emit_view()
-
-
 
     def get_state(self) -> Dict[str, Any]:
         return dict(
@@ -345,6 +342,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_id="-"; self.last_frame_wh=(0,0)
         self._fps_acc=0.0; self._fps_n=0; self._last_ts=time.perf_counter()
         self._overlay_until=0.0; self._last_overlay_img=None
+        self._overlay_mode='none'
+        self._measure_overlay_active=False
+        self._last_measure_tool=None
+        self._pending_measure_tool=None
         self._last_roi=None
         self._settings=QtCore.QSettings('vision_sdk','ui_client')
         self._log_buffer=[]
@@ -400,6 +401,28 @@ class MainWindow(QtWidgets.QMainWindow):
         mv.addRow(self.chk_anchor)
         mv.addRow(hbM)
         left_v.addWidget(meas_box)
+
+        # Detection settings
+        det_cfg=QtWidgets.QGroupBox("Detection Settings")
+        df=QtWidgets.QFormLayout(det_cfg)
+        self.dsb_det_score=QtWidgets.QDoubleSpinBox(); self.dsb_det_score.setRange(0.0,1.0); self.dsb_det_score.setSingleStep(0.01); self.dsb_det_score.setDecimals(3); self.dsb_det_score.setValue(0.25)
+        self.sp_det_inliers=QtWidgets.QSpinBox(); self.sp_det_inliers.setRange(1,200); self.sp_det_inliers.setValue(4)
+        self.dsb_det_angle=QtWidgets.QDoubleSpinBox(); self.dsb_det_angle.setRange(0.0,180.0); self.dsb_det_angle.setDecimals(1); self.dsb_det_angle.setSingleStep(1.0); self.dsb_det_angle.setValue(180.0)
+        self.dsb_det_ransac=QtWidgets.QDoubleSpinBox(); self.dsb_det_ransac.setRange(0.1,20.0); self.dsb_det_ransac.setDecimals(2); self.dsb_det_ransac.setSingleStep(0.1); self.dsb_det_ransac.setValue(4.0)
+        self.dsb_det_ratio=QtWidgets.QDoubleSpinBox(); self.dsb_det_ratio.setRange(0.1,1.0); self.dsb_det_ratio.setDecimals(2); self.dsb_det_ratio.setSingleStep(0.01); self.dsb_det_ratio.setValue(0.90)
+        self.sp_det_matches=QtWidgets.QSpinBox(); self.sp_det_matches.setRange(10,1000); self.sp_det_matches.setValue(150)
+        self.sp_det_center=QtWidgets.QSpinBox(); self.sp_det_center.setRange(0,500); self.sp_det_center.setValue(40)
+        df.addRow("Min score", self.dsb_det_score)
+        df.addRow("Min inliers", self.sp_det_inliers)
+        df.addRow("Angle tolerance (deg)", self.dsb_det_angle)
+        df.addRow("RANSAC thr (px)", self.dsb_det_ransac)
+        df.addRow("Lowe ratio", self.dsb_det_ratio)
+        df.addRow("Max matches", self.sp_det_matches)
+        df.addRow("Min center dist (px)", self.sp_det_center)
+        self._det_settings_timer=QtCore.QTimer(self); self._det_settings_timer.setInterval(300); self._det_settings_timer.setSingleShot(True); self._det_settings_timer.timeout.connect(self._emit_detection_settings)
+        for w in [self.dsb_det_score,self.sp_det_inliers,self.dsb_det_angle,self.dsb_det_ransac,self.dsb_det_ratio,self.sp_det_matches,self.sp_det_center]:
+            w.valueChanged.connect(lambda *_: self._det_settings_timer.start())
+        left_v.addWidget(det_cfg)
 
         # Detections table (kept)
         det_tbl=QtWidgets.QGroupBox("Detections"); dv=QtWidgets.QVBoxLayout(det_tbl)
@@ -518,6 +541,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except (TypeError, ValueError):
                 return None
 
+        def to_float(val):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
         def to_str(val):
             return val if isinstance(val, str) else None
 
@@ -593,6 +622,45 @@ class MainWindow(QtWidgets.QMainWindow):
             for w, prev in blocked:
                 w.blockSignals(prev)
 
+        det_widgets = [
+            self.dsb_det_score,
+            self.sp_det_inliers,
+            self.dsb_det_angle,
+            self.dsb_det_ransac,
+            self.dsb_det_ratio,
+            self.sp_det_matches,
+            self.sp_det_center,
+        ]
+        for w in det_widgets:
+            w.blockSignals(True)
+        try:
+            val = to_float(settings.value('detection/min_score'))
+            if val is not None:
+                self.dsb_det_score.setValue(val)
+            val = to_int(settings.value('detection/min_inliers'))
+            if val is not None:
+                self.sp_det_inliers.setValue(val)
+            val = to_float(settings.value('detection/angle_tol_deg'))
+            if val is not None:
+                self.dsb_det_angle.setValue(val)
+            val = to_float(settings.value('detection/ransac_thr_px'))
+            if val is not None:
+                self.dsb_det_ransac.setValue(val)
+            val = to_float(settings.value('detection/lowe_ratio'))
+            if val is not None:
+                self.dsb_det_ratio.setValue(val)
+            val = to_int(settings.value('detection/max_matches'))
+            if val is not None:
+                self.sp_det_matches.setValue(val)
+            val = to_int(settings.value('detection/min_center_dist_px'))
+            if val is not None:
+                self.sp_det_center.setValue(val)
+        finally:
+            for w in det_widgets:
+                w.blockSignals(False)
+        self._det_settings_timer.stop()
+        self._emit_detection_settings()
+
         controls_visible = to_bool(settings.value('panels/controls_visible'))
         if controls_visible is not None:
             self.controlsPanelAction.blockSignals(True)
@@ -661,6 +729,13 @@ class MainWindow(QtWidgets.QMainWindow):
         settings.setValue('panels/results_visible', bool(self.resultsDock.isVisible()))
         settings.setValue('panels/camera_visible', bool(self.cameraDock.isVisible()))
         settings.setValue('panels/controls_scroll', int(self.controlsPanel.verticalScrollBar().value()))
+        settings.setValue('detection/min_score', float(self.dsb_det_score.value()))
+        settings.setValue('detection/min_inliers', int(self.sp_det_inliers.value()))
+        settings.setValue('detection/angle_tol_deg', float(self.dsb_det_angle.value()))
+        settings.setValue('detection/ransac_thr_px', float(self.dsb_det_ransac.value()))
+        settings.setValue('detection/lowe_ratio', float(self.dsb_det_ratio.value()))
+        settings.setValue('detection/max_matches', int(self.sp_det_matches.value()))
+        settings.setValue('detection/min_center_dist_px', int(self.sp_det_center.value()))
         settings.setValue('camera/state', json.dumps(self.cam_panel.get_state()))
         settings.setValue('logs/history', json.dumps(self._log_buffer[-50:]))
         settings.sync()
@@ -674,6 +749,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send({"type":"set_publish_every","n":int(self.sp_every.value())})
         # initial params/view
         self.cam_panel._emit_params(); self.cam_panel._emit_view()
+        self._emit_detection_settings()
 
     def _ws_closed(self):
         self.btn_conn.setEnabled(True); self.btn_disc.setEnabled(False); self._ping.stop()
@@ -721,8 +797,16 @@ class MainWindow(QtWidgets.QMainWindow):
         now=time.perf_counter(); fps=1.0/max(1e-6,now-self._last_ts); self._last_ts=now
         self._fps_acc+=fps; self._fps_n+=1
         if self._fps_n>=10: self.lbl_fps.setText(f"FPS: {self._fps_acc/self._fps_n:.1f}"); self._fps_acc=0; self._fps_n=0
-        if time.time()<self._overlay_until and self._last_overlay_img is not None: qi=self._last_overlay_img
-        self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
+        display_qi = qi
+        if self._measure_overlay_active and self._overlay_mode == 'measure' and self._last_overlay_img is not None:
+            display_qi = self._last_overlay_img
+        elif self._last_overlay_img is not None and self._overlay_mode != 'measure':
+            if time.time() < self._overlay_until:
+                display_qi = self._last_overlay_img
+            else:
+                self._last_overlay_img = None
+                self._overlay_mode = 'none'
+        self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(display_qi))
 
     def _dets(self,msg:Dict):
         objs=msg.get("payload",{}).get("result",{}).get("objects",[])
@@ -748,9 +832,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cmb_anchor.blockSignals(True); self.cmb_anchor.clear(); self.cmb_anchor.addItems(new_list)
             if cur in new_list: self.cmb_anchor.setCurrentText(cur)
             self.cmb_anchor.blockSignals(False)
-        if "overlay_jpeg_b64" in msg:
+        if "overlay_jpeg_b64" in msg and not self._measure_overlay_active:
             qi=self._decode(msg["overlay_jpeg_b64"])
-            if qi: self._last_overlay_img=qi; self._overlay_until=time.time()+1.0; self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
+            if qi:
+                self._last_overlay_img=qi
+                self._overlay_mode='detect'
+                self._overlay_until=time.time()+1.0
+                self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
 
     def _combo_items(self, cmb: QtWidgets.QComboBox):
         return [cmb.itemText(i) for i in range(cmb.count())]
@@ -774,7 +862,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log(f"[measure] id={items['id']} kind={items['kind']} value={items['value']} {items['units']}")
         if "overlay_jpeg_b64" in msg:
             qi=self._decode(msg["overlay_jpeg_b64"])
-            if qi: self._last_overlay_img=qi; self._overlay_until=time.time()+1.0; self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
+            if qi:
+                self._last_overlay_img=qi
+                self._overlay_mode='measure'
+                self._measure_overlay_active=True
+                self._overlay_until=0.0
+                if self._pending_measure_tool is not None:
+                    self._last_measure_tool=self._pending_measure_tool
+                self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
+        if self._pending_measure_tool is not None:
+            if not self._measure_overlay_active:
+                self._last_measure_tool=self._pending_measure_tool
+            self._pending_measure_tool=None
 
     def _calib(self,msg:Dict):
         ok=msg.get("ok",False)
@@ -793,9 +892,13 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             self._fill_table(self.tbl_cal, items)
             self._append_log("[calibration] OK")
-            if "overlay_jpeg_b64" in msg:
+            if "overlay_jpeg_b64" in msg and not self._measure_overlay_active:
                 qi=self._decode(msg["overlay_jpeg_b64"])
-                if qi: self._last_overlay_img=qi; self._overlay_until=time.time()+1.0; self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
+                if qi:
+                    self._last_overlay_img=qi
+                    self._overlay_mode='calibration'
+                    self._overlay_until=time.time()+1.0
+                    self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
         else:
             self._append_log(f"[calibration] ERROR: {msg.get('error')}")
 
@@ -828,14 +931,35 @@ class MainWindow(QtWidgets.QMainWindow):
         if max(xs)-min(xs)<10 or max(ys)-min(ys)<10: return
         self._send({"type":"add_template_poly","slot":int(self.cmb_slot.currentIndex()),"name":self.ed_name.text() or f"Obj{self.cmb_slot.currentIndex()+1}","points":[[round(x,1),round(y,1)] for x,y in pts],"max_instances":int(self.sp_max.value())})
 
+    def _emit_detection_settings(self):
+        params = dict(min_score=float(self.dsb_det_score.value()),
+                      min_inliers=int(self.sp_det_inliers.value()),
+                      angle_tolerance_deg=float(self.dsb_det_angle.value()),
+                      ransac_thr_px=float(self.dsb_det_ransac.value()),
+                      lowe_ratio=float(self.dsb_det_ratio.value()),
+                      max_matches=int(self.sp_det_matches.value()),
+                      min_center_dist_px=int(self.sp_det_center.value()))
+        self._send({"type":"set_detection_params","params":params})
+
     def _slot_state(self):
         self._send({"type":"set_slot_state","slot":int(self.cmb_slot.currentIndex()),"enabled":self.chk_en.isChecked(),"max_instances":int(self.sp_max.value())})
 
     def _run_measure(self, tool: str):
+        if self._measure_overlay_active and self._last_measure_tool == tool:
+            self._measure_overlay_active = False
+            self._last_measure_tool = None
+            self._pending_measure_tool = None
+            self._last_overlay_img = None
+            self._overlay_mode = 'none'
+            self._overlay_until = 0.0
+            return
+
         roi = self._last_roi
         if roi is None:
             self.status.showMessage("Select a Rect ROI first", 3000)
             return
+        self._pending_measure_tool = tool
+        self._measure_overlay_active = False
         job={"tool":tool,"params":{},"roi":roi}
         x,y,w,h=roi
         if tool=="point_pick": job["params"]={"hint_xy":[x+w*0.5,y+h*0.5]}

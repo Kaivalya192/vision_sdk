@@ -6,7 +6,7 @@
 - Simple duplicate suppression via minimum center distance per object.
 """
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 import cv2, numpy as np
 
 from .primitive import SIFTMatcher
@@ -32,9 +32,23 @@ class MultiTemplateMatcher:
     Each slot may return multiple detections (instances).
     Simple duplicate suppression ensures instances are spatially separated.
     """
-    def __init__(self, max_slots: int = 5, min_center_dist_px: int = 40):
+    def __init__(
+        self,
+        max_slots: int = 5,
+        min_center_dist_px: int = 40,
+        matcher_defaults: Optional[Dict[str, Any]] = None,
+        angle_tolerance_deg: float = 180.0,
+    ):
         self.max_slots = max(1, min(5, max_slots))
         self.min_center_dist_px = max(0, int(min_center_dist_px))
+        base_matcher = SIFTMatcher()
+        self.matcher_defaults: Dict[str, Any] = base_matcher.params.copy()
+        self.matcher_defaults.pop("max_instances", None)
+        if matcher_defaults:
+            for k, v in matcher_defaults.items():
+                if k in self.matcher_defaults:
+                    self.matcher_defaults[k] = v
+        self.angle_tolerance_deg = float(angle_tolerance_deg)
         self.slots: List[TemplateSlot] = []
 
     # ---- configuration helpers ----
@@ -42,6 +56,22 @@ class MultiTemplateMatcher:
         """Set minimum allowed distance (in processed-frame pixels) between
         centers of multiple instances of the SAME object."""
         self.min_center_dist_px = max(0, int(px))
+
+    def set_angle_tolerance(self, degrees: float):
+        self.angle_tolerance_deg = max(0.0, float(degrees))
+
+    def set_matcher_defaults(self, **params: Any):
+        applied: Dict[str, Any] = {}
+        for key, value in params.items():
+            if key in self.matcher_defaults:
+                self.matcher_defaults[key] = value
+                applied[key] = value
+                for slot in self.slots:
+                    slot.matcher.update_params(**{key: value})
+        return applied
+
+    def get_matcher_defaults(self) -> Dict[str, Any]:
+        return dict(self.matcher_defaults)
 
     # ---- slot management ----
     def _ensure_index(self, index: int):
@@ -63,6 +93,9 @@ class MultiTemplateMatcher:
             return
         self._ensure_index(index)
         m = SIFTMatcher(max_instances=max_instances)
+        if self.matcher_defaults:
+            m.update_params(**self.matcher_defaults)
+        m.update_params(max_instances=int(max_instances))
         m.set_template(roi_bgr)
         self.slots[index] = TemplateSlot(name=name, matcher=m, color=PALETTE[index % len(PALETTE)], enabled=True)
 
@@ -75,6 +108,9 @@ class MultiTemplateMatcher:
             return
         self._ensure_index(index)
         m = SIFTMatcher(max_instances=max_instances)
+        if self.matcher_defaults:
+            m.update_params(**self.matcher_defaults)
+        m.update_params(max_instances=int(max_instances))
         m.set_template_polygon(roi_bgr, roi_mask)
         self.slots[index] = TemplateSlot(name=name, matcher=m, color=PALETTE[index % len(PALETTE)], enabled=True)
 
@@ -117,6 +153,9 @@ class MultiTemplateMatcher:
             # ---- simple duplicate suppression (per object) ----
             kept: List[Dict] = []
             for det in raw_dets:
+                theta = float(det.get("theta", 0.0))
+                if abs(theta) > self.angle_tolerance_deg:
+                    continue
                 # center preferred; fallback to pose (tx,ty)
                 c = det.get("center")
                 if c is None:
