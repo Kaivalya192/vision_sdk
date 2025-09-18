@@ -125,7 +125,9 @@ def _apply_anchor(roi_xy: np.ndarray, job: Dict[str, Any], detections: Dict[str,
         det = detections.get(str(anchor_obj))
     if not isinstance(det, dict):
         return roi_xy
-    H = det.get("H_template_to_frame") or det.get("H")
+    H = det.get("H_template_to_frame")
+    if H is None:
+        H = det.get("H")
     if H is None:
         return roi_xy
     H = np.asarray(H, dtype=np.float64).reshape(3, 3)

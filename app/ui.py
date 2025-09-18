@@ -4,7 +4,7 @@
 RPi Vision Client – with Results dock and Measure/Calibrate controls
 """
 
-import sys, time, base64, json
+import sys, time, base64, json, math
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import cv2
@@ -347,6 +347,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_measure_tool=None
         self._pending_measure_tool=None
         self._last_roi=None
+        self._last_roi_quad=None
+        self._measure_roi_a=None
+        self._measure_roi_b=None
+        self._capture_mode=None
         self._settings=QtCore.QSettings('vision_sdk','ui_client')
         self._log_buffer=[]
 
@@ -395,12 +399,26 @@ class MainWindow(QtWidgets.QMainWindow):
         meas_box=QtWidgets.QGroupBox("Measure"); mv=QtWidgets.QFormLayout(meas_box)
         self.chk_anchor=QtWidgets.QCheckBox("Anchor ROI to detection")
         self.cmb_anchor=QtWidgets.QComboBox(); self.cmb_anchor.setEditable(True); self.cmb_anchor.setEditText("Obj1")
-        hbM=QtWidgets.QHBoxLayout(); self.btn_pick=QtWidgets.QPushButton("Pick point"); self.btn_p2p=QtWidgets.QPushButton("P2P distance"); self.btn_fit=QtWidgets.QPushButton("Fit line"); self.btn_p2l=QtWidgets.QPushButton("Point → Line")
-        for w in (self.btn_pick,self.btn_p2p,self.btn_fit,self.btn_p2l): hbM.addWidget(w)
+        roi_btns=QtWidgets.QHBoxLayout(); self.btn_roi_a=QtWidgets.QPushButton("Set ROI A"); self.btn_roi_b=QtWidgets.QPushButton("Set ROI B"); self.btn_roi_clear=QtWidgets.QPushButton("Clear ROIs")
+        for w in (self.btn_roi_a,self.btn_roi_b,self.btn_roi_clear): roi_btns.addWidget(w)
+        roi_labels=QtWidgets.QVBoxLayout(); self.lbl_roi_a=QtWidgets.QLabel("ROI A: -"); self.lbl_roi_b=QtWidgets.QLabel("ROI B: -"); roi_labels.addWidget(self.lbl_roi_a); roi_labels.addWidget(self.lbl_roi_b)
+        mm_layout=QtWidgets.QHBoxLayout(); self.dsb_mm_x=QtWidgets.QDoubleSpinBox(); self.dsb_mm_y=QtWidgets.QDoubleSpinBox()
+        for dsb in (self.dsb_mm_x,self.dsb_mm_y): dsb.setRange(0.0,10.0); dsb.setDecimals(4); dsb.setSingleStep(0.0005); dsb.setValue(0.0)
+        mm_layout.addWidget(QtWidgets.QLabel("X")); mm_layout.addWidget(self.dsb_mm_x); mm_layout.addWidget(QtWidgets.QLabel("Y")); mm_layout.addWidget(self.dsb_mm_y); mm_layout.addStretch(1)
+        tools_row1=QtWidgets.QHBoxLayout(); self.btn_edge=QtWidgets.QPushButton("Edge"); self.btn_distance=QtWidgets.QPushButton("Distance"); self.btn_angle=QtWidgets.QPushButton("Angle")
+        for w in (self.btn_edge,self.btn_distance,self.btn_angle): tools_row1.addWidget(w)
+        tools_row2=QtWidgets.QHBoxLayout(); self.btn_circle=QtWidgets.QPushButton("Circle radius"); self.btn_pick=QtWidgets.QPushButton("Point pick")
+        for w in (self.btn_circle,self.btn_pick): tools_row2.addWidget(w)
+        tools_row2.addStretch(1)
         mv.addRow("Anchor source", self.cmb_anchor)
         mv.addRow(self.chk_anchor)
-        mv.addRow(hbM)
+        mv.addRow("ROIs", roi_btns)
+        mv.addRow(roi_labels)
+        mv.addRow("mm/px (0=auto)", mm_layout)
+        mv.addRow("Tools", tools_row1)
+        mv.addRow(tools_row2)
         left_v.addWidget(meas_box)
+        self._update_measure_roi_labels()
 
         # Detection settings
         det_cfg=QtWidgets.QGroupBox("Detection Settings")
@@ -481,8 +499,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_w.currentTextChanged.connect(lambda w: self._send({"type":"set_proc_width","width":int(w)}))
         self.sp_every.valueChanged.connect(lambda n: self._send({"type":"set_publish_every","n":int(n)}))
         self.cmb_slot.currentIndexChanged.connect(self._slot_state); self.sp_max.valueChanged.connect(self._slot_state); self.chk_en.toggled.connect(self._slot_state)
-        self.btn_rect.clicked.connect(lambda: self.video.enable_rect_selection(True))
-        self.btn_poly.clicked.connect(lambda: self.video.enable_polygon_selection(True))
+        self.btn_rect.clicked.connect(lambda: self._start_capture('detect_rect', polygon=False))
+        self.btn_poly.clicked.connect(lambda: self._start_capture('detect_poly', polygon=True))
         self.btn_clear.clicked.connect(lambda: self._send({"type":"clear_template","slot":int(self.cmb_slot.currentIndex())}))
         self.cam_panel.paramsChanged.connect(lambda p: self._send({"type":"set_params","params":p}))
         self.cam_panel.viewChanged.connect(lambda v: self._send({"type":"set_view",**v}))
@@ -490,11 +508,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video.roiSelected.connect(self._rect_roi); self.video.polygonSelected.connect(self._poly_roi)
 
         # measure wiring
-        self.btn_pick.clicked.connect(lambda: self._run_measure("point_pick"))
-        self.btn_fit.clicked.connect(lambda: self._run_measure("line_fit"))
-        self.btn_p2p.clicked.connect(lambda: self._run_measure("distance_p2p"))
-        self.btn_p2l.clicked.connect(lambda: self._run_measure("distance_p2l"))
+        self.btn_roi_a.clicked.connect(lambda: self._start_capture('measure_a', polygon=False))
+        self.btn_roi_b.clicked.connect(lambda: self._start_capture('measure_b', polygon=False))
+        self.btn_roi_clear.clicked.connect(self._clear_measure_rois)
+        self.btn_edge.clicked.connect(lambda: self._run_measure('edge'))
+        self.btn_distance.clicked.connect(lambda: self._run_measure('distance'))
+        self.btn_angle.clicked.connect(lambda: self._run_measure('angle'))
+        self.btn_circle.clicked.connect(lambda: self._run_measure('circle_radius'))
+        self.btn_pick.clicked.connect(lambda: self._run_measure('point_pick'))
         self.cmb_anchor.currentTextChanged.connect(lambda name: self._send({"type":"set_anchor_source","object":name}))
+
 
         self.btn_calib.clicked.connect(lambda: self._send({"type":"calibrate_one_click"}))
 
@@ -845,35 +868,48 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- measures/calibration ----
     def _measures(self,msg:Dict):
-        pkt=msg.get("packet",{})
+        pkt = msg.get("packet", {})
         self._fill_table(self.tbl_meas, {})
-        meas=pkt.get("measures",[])
+        meas = pkt.get("measures", [])
+        overlay_b64 = msg.get("overlay_jpeg_b64") or pkt.get("overlay_jpeg_b64")
         if meas:
-            m=meas[0]
-            items={
-                "id": m.get("id"),
-                "kind": m.get("kind"),
-                "value": f"{m.get('value',0.0):.3f}",
-                "units": pkt.get("units","px"),
-                "pass": m.get("pass"),
-                "sigma": m.get("sigma"),
+            m = dict(meas[0] or {})
+            value = m.get("value")
+            if isinstance(value, (int, float)):
+                value_str = f"{value:.3f}" if math.isfinite(value) else str(value)
+            else:
+                value_str = str(value)
+            units = m.get("units") or pkt.get("units") or "-"
+            items = {
+                "id": m.get("id", "-"),
+                "kind": m.get("kind", "-"),
+                "value": value_str,
+                "units": units,
             }
+            meta = m.get("meta")
+            if isinstance(meta, dict):
+                for key, val in meta.items():
+                    if isinstance(val, float):
+                        items[f"meta.{key}"] = f"{val:.3f}" if math.isfinite(val) else str(val)
+                    else:
+                        items[f"meta.{key}"] = val
             self._fill_table(self.tbl_meas, items)
-            self._append_log(f"[measure] id={items['id']} kind={items['kind']} value={items['value']} {items['units']}")
-        if "overlay_jpeg_b64" in msg:
-            qi=self._decode(msg["overlay_jpeg_b64"])
+            log_units = units if units and units != '-' else ''
+            self._append_log(f"[measure] id={items['id']} kind={items['kind']} value={value_str} {log_units}".rstrip())
+        if overlay_b64:
+            qi = self._decode(overlay_b64)
             if qi:
-                self._last_overlay_img=qi
-                self._overlay_mode='measure'
-                self._measure_overlay_active=True
-                self._overlay_until=0.0
+                self._last_overlay_img = qi
+                self._overlay_mode = 'measure'
+                self._measure_overlay_active = True
+                self._overlay_until = 0.0
                 if self._pending_measure_tool is not None:
-                    self._last_measure_tool=self._pending_measure_tool
+                    self._last_measure_tool = self._pending_measure_tool
                 self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
         if self._pending_measure_tool is not None:
             if not self._measure_overlay_active:
-                self._last_measure_tool=self._pending_measure_tool
-            self._pending_measure_tool=None
+                self._last_measure_tool = self._pending_measure_tool
+            self._pending_measure_tool = None
 
     def _calib(self,msg:Dict):
         ok=msg.get("ok",False)
@@ -907,6 +943,57 @@ class MainWindow(QtWidgets.QMainWindow):
         for k,v in data.items():
             r=tbl.rowCount(); tbl.insertRow(r); tbl.setItem(r,0,QtWidgets.QTableWidgetItem(str(k))); tbl.setItem(r,1,QtWidgets.QTableWidgetItem(str(v)))
 
+    # ---- measurement ROI helpers ----
+    def _start_capture(self, mode: str, polygon: bool):
+        self._capture_mode = mode
+        if polygon:
+            self.video.enable_polygon_selection(True)
+            hint = 'Polygon'
+        else:
+            self.video.enable_rect_selection(True)
+            hint = 'Rectangle'
+        target = 'measurement' if mode.startswith('measure') else 'template'
+        self.status.showMessage(f"{hint} capture for {target}", 2000)
+
+    def _quad_from_rect(self, x: float, y: float, w: float, h: float):
+        x2 = x + w
+        y2 = y + h
+        return [[float(x), float(y)], [float(x2), float(y)], [float(x2), float(y2)], [float(x), float(y2)]]
+
+    def _points_to_quad(self, pts):
+        if not pts or len(pts) < 3:
+            return None
+        arr = np.asarray(pts, dtype=np.float32)
+        rect = cv2.minAreaRect(arr)
+        box = cv2.boxPoints(rect)
+        return [[float(p[0]), float(p[1])] for p in box]
+
+    def _set_measure_roi(self, which: str, quad):
+        quad_list = [[float(x), float(y)] for x, y in quad]
+        if which == 'A':
+            self._measure_roi_a = quad_list
+        else:
+            self._measure_roi_b = quad_list
+        self._update_measure_roi_labels()
+
+    def _clear_measure_rois(self):
+        self._measure_roi_a = None
+        self._measure_roi_b = None
+        self._update_measure_roi_labels()
+        self.status.showMessage('Measurement ROIs cleared', 2000)
+
+    def _update_measure_roi_labels(self):
+        def describe(quad):
+            if not quad:
+                return '-'
+            xs = [p[0] for p in quad]
+            ys = [p[1] for p in quad]
+            return f"{min(xs):.0f},{min(ys):.0f} to {max(xs):.0f},{max(ys):.0f}"
+        if hasattr(self, 'lbl_roi_a'):
+            self.lbl_roi_a.setText(f"ROI A: {describe(self._measure_roi_a)}")
+        if hasattr(self, 'lbl_roi_b'):
+            self.lbl_roi_b.setText(f"ROI B: {describe(self._measure_roi_b)}")
+
     # ---- ROI capture mapping ----
     def _disp_to_proc(self,qp:QtCore.QPointF):
         draw=self.video._last_draw_rect; fw,fh=self.last_frame_wh
@@ -915,21 +1002,73 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _rect_roi(self,rect:QtCore.QRect):
         draw = self.video._last_draw_rect
-        if draw.isNull(): return
+        mode = self._capture_mode or 'detect_rect'
+        if draw.isNull():
+            self._capture_mode = None
+            return
         sel = rect.intersected(draw)
-        if sel.isEmpty(): return
-        (x,y)=self._disp_to_proc(sel.topLeft()); w=sel.width()*self.last_frame_wh[0]/draw.width(); h=sel.height()*self.last_frame_wh[1]/draw.height()
-        if w<10 or h<10: return
-        self._last_roi=[int(x),int(y),int(w),int(h)]
-        self._send({"type":"add_template_rect","slot":int(self.cmb_slot.currentIndex()),"name":self.ed_name.text() or f"Obj{self.cmb_slot.currentIndex()+1}","rect":self._last_roi,"max_instances":int(self.sp_max.value())})
+        if sel.isEmpty():
+            self._capture_mode = None
+            return
+        x, y = self._disp_to_proc(sel.topLeft())
+        scale_x = self.last_frame_wh[0] / float(draw.width()) if draw.width() else 0.0
+        scale_y = self.last_frame_wh[1] / float(draw.height()) if draw.height() else 0.0
+        w = sel.width() * scale_x
+        h = sel.height() * scale_y
+        if w < 10 or h < 10:
+            self._capture_mode = None
+            return
+        quad = self._quad_from_rect(x, y, w, h)
+        self._last_roi = [int(round(x)), int(round(y)), int(round(w)), int(round(h))]
+        self._last_roi_quad = quad
+        self._capture_mode = None
+        if mode == 'measure_a':
+            self._set_measure_roi('A', quad)
+            self.status.showMessage('ROI A set', 2000)
+            return
+        if mode == 'measure_b':
+            self._set_measure_roi('B', quad)
+            self.status.showMessage('ROI B set', 2000)
+            return
+        name = self.ed_name.text() or f"Obj{self.cmb_slot.currentIndex()+1}"
+        payload = {"type":"add_template_rect","slot":int(self.cmb_slot.currentIndex()),"name":name,"rect":self._last_roi,"max_instances":int(self.sp_max.value())}
+        self._send(payload)
 
     def _poly_roi(self,qpts:List[QtCore.QPoint]):
-        draw=self.video._last_draw_rect
-        if draw.isNull(): return
-        pts=[self._disp_to_proc(p) for p in qpts]
-        xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
-        if max(xs)-min(xs)<10 or max(ys)-min(ys)<10: return
-        self._send({"type":"add_template_poly","slot":int(self.cmb_slot.currentIndex()),"name":self.ed_name.text() or f"Obj{self.cmb_slot.currentIndex()+1}","points":[[round(x,1),round(y,1)] for x,y in pts],"max_instances":int(self.sp_max.value())})
+        draw = self.video._last_draw_rect
+        mode = self._capture_mode or 'detect_poly'
+        if draw.isNull():
+            self._capture_mode = None
+            return
+        pts = [self._disp_to_proc(p) for p in qpts]
+        if len(pts) < 3:
+            self._capture_mode = None
+            return
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        if max(xs) - min(xs) < 10 or max(ys) - min(ys) < 10:
+            self._capture_mode = None
+            return
+        quad = self._points_to_quad(pts)
+        if quad:
+            self._last_roi_quad = quad
+        self._capture_mode = None
+        if mode == 'measure_a':
+            if quad:
+                self._set_measure_roi('A', quad)
+                self.status.showMessage('ROI A set', 2000)
+            else:
+                self.status.showMessage('Need 3+ points for ROI', 2000)
+            return
+        if mode == 'measure_b':
+            if quad:
+                self._set_measure_roi('B', quad)
+                self.status.showMessage('ROI B set', 2000)
+            else:
+                self.status.showMessage('Need 3+ points for ROI', 2000)
+            return
+        payload = {"type":"add_template_poly","slot":int(self.cmb_slot.currentIndex()),"name":self.ed_name.text() or f"Obj{self.cmb_slot.currentIndex()+1}","points":[[round(x,1),round(y,1)] for x,y in pts],"max_instances":int(self.sp_max.value())}
+        self._send(payload)
 
     def _emit_detection_settings(self):
         params = dict(min_score=float(self.dsb_det_score.value()),
@@ -954,18 +1093,36 @@ class MainWindow(QtWidgets.QMainWindow):
             self._overlay_until = 0.0
             return
 
-        roi = self._last_roi
-        if roi is None:
-            self.status.showMessage("Select a Rect ROI first", 3000)
+        if not self._measure_roi_a:
+            self.status.showMessage('Set ROI A first', 3000)
             return
+        if tool in ('distance', 'angle') and not self._measure_roi_b:
+            self.status.showMessage('Set ROI B for this tool', 3000)
+            return
+
+        roi_a = [list(p) for p in (self._measure_roi_a or [])]
+        roi_b = [list(p) for p in (self._measure_roi_b or [])] if self._measure_roi_b else None
+
+        job = {"tool": tool, "roiA_poly": roi_a}
+        if roi_b:
+            job["roiB_poly"] = roi_b
+
+        mm_x = float(self.dsb_mm_x.value())
+        mm_y = float(self.dsb_mm_y.value())
+        if mm_x > 0 and mm_y > 0:
+            job["mm_per_px"] = [mm_x, mm_y]
+
+        anchor_checked = bool(self.chk_anchor.isChecked())
+        anchor_name = self.cmb_anchor.currentText().strip()
+        if anchor_checked:
+            job["anchor"] = True
+            if anchor_name:
+                job["anchor_object"] = anchor_name
+
         self._pending_measure_tool = tool
         self._measure_overlay_active = False
-        job={"tool":tool,"params":{},"roi":roi}
-        x,y,w,h=roi
-        if tool=="point_pick": job["params"]={"hint_xy":[x+w*0.5,y+h*0.5]}
-        elif tool=="distance_p2p": job["params"]={"p1":[x,y+h*0.5],"p2":[x+w,y+h*0.5]}
-        elif tool=="distance_p2l": job["params"]={"pt":[x+w*0.5,y+h*0.5]}
-        self._send({"type":"run_measure","job":job,"anchor":bool(self.chk_anchor.isChecked())})
+        payload = {"type": "run_measure", "job": job, "anchor": anchor_checked}
+        self._send(payload)
 
     # ---- send ----
     def _send(self,obj):
