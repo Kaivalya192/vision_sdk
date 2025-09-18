@@ -134,6 +134,15 @@ def _apply_anchor(roi_xy: np.ndarray, job: Dict[str, Any], detections: Dict[str,
     return warped.astype(np.float32)
 
 
+def _polygon_centroid(poly: np.ndarray) -> Tuple[float, float]:
+    pts = poly.reshape(-1, 1, 2).astype(np.float32)
+    m = cv2.moments(pts)
+    if m.get("m00"):
+        return float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"])
+    mean_xy = poly.mean(axis=0)
+    return float(mean_xy[0]), float(mean_xy[1])
+
+
 def _draw_roi(img: np.ndarray, poly: np.ndarray, color: tuple[int, int, int]) -> None:
     pts = poly.reshape(-1, 1, 2).astype(np.int32)
     cv2.polylines(img, [pts], True, color, 1, lineType=cv2.LINE_AA)
@@ -154,6 +163,11 @@ def _draw_circle(img: np.ndarray, circle, color: tuple[int, int, int]) -> None:
     cv2.circle(img, c, 2, (255, 255, 255), -1, lineType=cv2.LINE_AA)
 
 
+def _draw_point(img: np.ndarray, point_xy: Tuple[float, float], color: tuple[int, int, int]) -> None:
+    pt = (int(round(point_xy[0])), int(round(point_xy[1])))
+    cv2.drawMarker(img, pt, color, markerType=cv2.MARKER_CROSS, markerSize=12, thickness=2, line_type=cv2.LINE_AA)
+
+
 def _encode_overlay(img_bgr: np.ndarray) -> str:
     ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok:
@@ -171,7 +185,7 @@ def run_measure_on_frame(
 
     job_dict = dict(job or {})
     tool = str(job_dict.get("tool") or job_dict.get("kind") or "edge").lower()
-    if tool not in {"edge", "distance", "angle", "circle_radius"}:
+    if tool not in {"edge", "distance", "angle", "circle_radius", "point_pick"}:
         raise ValueError(f"Unsupported measurement tool: {tool}")
 
     # ROIs
@@ -227,13 +241,29 @@ def run_measure_on_frame(
         ang = float(angle_between_edges_deg(ea, eb))
         entry = {"id": measure_id, "kind": tool, "value": ang, "units": "deg"}
         packet_units = None
+    elif tool == "point_pick":
+        point_xy = _polygon_centroid(roi_a)
+        _draw_point(overlay, point_xy, (0, 255, 255))
+        entry = {
+            "id": measure_id,
+            "kind": tool,
+            "value": 0.0,
+            "meta": {"point_xy": [float(point_xy[0]), float(point_xy[1])]}
+        }
+        packet_units = None
     else:  # circle_radius
         circle = circle_radius_in_roi(frame_bgr, roi_a, mm_per_px)
         if circle is not None:
             _draw_circle(overlay, circle, (255, 128, 0))
             entry = {"id": measure_id, "kind": tool, "value": float(circle.radius_mm), "units": "mm"}
         else:
-            entry = {"id": measure_id, "kind": tool, "value": float("nan"), "units": "mm"}
+            entry = {
+                "id": measure_id,
+                "kind": tool,
+                "value": 0.0,
+                "units": "mm",
+                "meta": {"ok": False, "reason": "insufficient_edge_points"}
+            }
         packet_units = "mm"
 
     packet: Dict[str, Any] = {
