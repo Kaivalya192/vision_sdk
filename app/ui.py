@@ -401,6 +401,18 @@ class MainWindow(QtWidgets.QMainWindow):
         mv.addRow(self.chk_anchor)
         mv.addRow(hbM)
         left_v.addWidget(meas_box)
+        
+        # --- Virtual Points (NEW) ---
+        vp_box = QtWidgets.QGroupBox("Virtual Points")
+        vh = QtWidgets.QHBoxLayout(vp_box)
+        self.btn_vp_init = QtWidgets.QPushButton("Define VPts")
+        self.btn_vp_track = QtWidgets.QPushButton("Track VPts")
+        self.btn_vp_track.setCheckable(True)
+        for w in (self.btn_vp_init, self.btn_vp_track): vh.addWidget(w)
+        left_v.addWidget(vp_box)
+        # timer for tracking
+        self._vp_timer = QtCore.QTimer(self); self._vp_timer.setInterval(120)  # ~8 Hz
+        # --- end Virtual Points ---
 
         # Detection settings
         det_cfg=QtWidgets.QGroupBox("Detection Settings")
@@ -495,6 +507,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_p2p.clicked.connect(lambda: self._run_measure("distance_p2p"))
         self.btn_p2l.clicked.connect(lambda: self._run_measure("distance_p2l"))
         self.cmb_anchor.currentTextChanged.connect(lambda name: self._send({"type":"set_anchor_source","object":name}))
+
+        # virtual points wiring
+        self.btn_vp_init.clicked.connect(self._vp_init)
+        self.btn_vp_track.toggled.connect(self._vp_toggle)
+        self._vp_timer.timeout.connect(lambda: self._send({"type":"run_measure",
+                                                        "job":{"tool":"vp_step","params":{},"roi":self._last_roi},
+                                                        "anchor":bool(self.chk_anchor.isChecked())}))
 
         self.btn_calib.clicked.connect(lambda: self._send({"type":"calibrate_one_click"}))
 
@@ -943,6 +962,38 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _slot_state(self):
         self._send({"type":"set_slot_state","slot":int(self.cmb_slot.currentIndex()),"enabled":self.chk_en.isChecked(),"max_instances":int(self.sp_max.value())})
+
+    def _vp_init(self):
+        roi = self._last_roi
+        if roi is None:
+            self.status.showMessage("Select a Rect ROI first", 3000); return
+        x,y,w,h = roi
+        # Two default relative points (25% and 75% on the midline)
+        params = {
+            "p1_rel": [0.25, 0.50],
+            "p2_rel": [0.75, 0.50],
+            "patch_px": 21,
+            "search_px": max(41, int(min(w, h) * 0.5)),  # adapt search to ROI size
+            "update_alpha": 0.15,
+            "conf_thr": 0.6
+        }
+        self._send({"type":"run_measure",
+                    "job":{"tool":"vp_init","params":params,"roi":roi},
+                    "anchor":bool(self.chk_anchor.isChecked())})
+
+    def _vp_toggle(self, on: bool):
+        if on:
+            if self._last_roi is None:
+                self.status.showMessage("Select a Rect ROI first", 3000)
+                self.btn_vp_track.setChecked(False)
+                return
+            # Kick one step immediately, then start timer
+            self._send({"type":"run_measure",
+                        "job":{"tool":"vp_step","params":{},"roi":self._last_roi},
+                        "anchor":bool(self.chk_anchor.isChecked())})
+            self._vp_timer.start()
+        else:
+            self._vp_timer.stop()
 
     def _run_measure(self, tool: str):
         # Toggle off overlay if same tool clicked while showing measure overlay
