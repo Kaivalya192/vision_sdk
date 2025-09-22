@@ -15,11 +15,19 @@ from PyQt5 import QtCore, QtGui, QtWidgets, QtWebSockets
 class VideoLabel(QtWidgets.QLabel):
     roiSelected      = QtCore.pyqtSignal(QtCore.QRect)
     polygonSelected  = QtCore.pyqtSignal(object)            # list[QPoint]
+    vpPointsChanged  = QtCore.pyqtSignal(object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
         self._last_draw_rect = QtCore.QRect()
+        # --- VP define/drag state (NEW) ---
+        self._frame_wh = (0, 0)              # (W,H) of original frame
+        self._vp_mode  = False               # define-mode on/off
+        self._vp_roi_proc = None             # ROI in process/frame coords [x,y,w,h]
+        self._vp_pts_rel  = [[0.25, 0.5], [0.75, 0.5]]  # u,v in [0..1] inside ROI
+        self._vp_drag_idx = -1               # -1:none, 0 or 1 == which point is being dragged
+        self._vp_hit_radius = 12             # px in DISPLAY space
 
         # rect ROI
         self._rect_mode = False
@@ -29,6 +37,51 @@ class VideoLabel(QtWidgets.QLabel):
         # polygon ROI
         self._poly_mode = False
         self._poly_pts  = []
+        
+    # NEW: tell label the frame (w,h) so it can map proc<->display
+    def setFrameSize(self, wh: Tuple[int, int]):
+        self._frame_wh = (int(wh[0]), int(wh[1]))
+
+    # NEW: enable/disable VP define mode; roi_proc = [x,y,w,h]; pts_rel = [[u1,v1],[u2,v2]]
+    def enable_vp_define(self, ok: bool, roi_proc: Optional[List[int]] = None,
+                         pts_rel: Optional[List[List[float]]] = None):
+        self._vp_mode = ok
+        if ok:
+            if roi_proc is not None: self._vp_roi_proc = list(map(int, roi_proc))
+            if pts_rel  is not None: self._vp_pts_rel  = [[float(pts_rel[0][0]), float(pts_rel[0][1])],
+                                                          [float(pts_rel[1][0]), float(pts_rel[1][1])]]
+        else:
+            self._vp_drag_idx = -1
+        self.update()
+
+    # map PROC (frame) -> DISPLAY QPointF
+    def _proc_to_disp(self, x: float, y: float) -> QtCore.QPointF:
+        W, H = self._frame_wh
+        if W <= 0 or H <= 0 or self._last_draw_rect.isNull():
+            return QtCore.QPointF(0, 0)
+        dw, dh = self._last_draw_rect.width(), self._last_draw_rect.height()
+        sx = dw / float(W); sy = dh / float(H)
+        return QtCore.QPointF(self._last_draw_rect.x() + x * sx,
+                              self._last_draw_rect.y() + y * sy)
+
+    # map DISPLAY QPointF -> PROC coords (float)
+    def _disp_to_proc_xy(self, qp: QtCore.QPointF) -> Tuple[float, float]:
+        W, H = self._frame_wh
+        if W <= 0 or H <= 0 or self._last_draw_rect.isNull():
+            return (0.0, 0.0)
+        dw, dh = self._last_draw_rect.width(), self._last_draw_rect.height()
+        sx = W / float(dw); sy = H / float(dh)
+        return ((qp.x() - self._last_draw_rect.x()) * sx,
+                (qp.y() - self._last_draw_rect.y()) * sy)
+
+    # get ROI rect in DISPLAY coords
+    def _vp_roi_disp_rect(self) -> Optional[QtCore.QRectF]:
+        if not self._vp_mode or self._vp_roi_proc is None:
+            return None
+        x, y, w, h = self._vp_roi_proc
+        tl = self._proc_to_disp(x, y)
+        br = self._proc_to_disp(x + w, y + h)
+        return QtCore.QRectF(tl, br)
 
     def setPixmapKeepAspect(self, pm: QtGui.QPixmap):
         if pm.isNull():
@@ -48,6 +101,31 @@ class VideoLabel(QtWidgets.QLabel):
                 p.drawLine(self._poly_pts[i-1], self._poly_pts[i])
             for q in self._poly_pts:
                 p.drawEllipse(q, 3, 3)
+        # --- draw VP define overlay (NEW) ---
+        if self._vp_mode and self._vp_roi_proc is not None:
+            # ROI rect in display
+            r = self._vp_roi_disp_rect()
+            if r is not None:
+                pen = QtGui.QPen(QtCore.Qt.gray); pen.setWidth(1); p.setPen(pen)
+                p.drawRect(r)
+
+                # points in display
+                x, y, w, h = self._vp_roi_proc
+                for idx, (u, v) in enumerate(self._vp_pts_rel):
+                    px = x + u * w
+                    py = y + v * h
+                    q = self._proc_to_disp(px, py)
+                    pen = QtGui.QPen(QtCore.Qt.yellow if idx == 0 else QtCore.Qt.cyan)
+                    pen.setWidth(2); p.setPen(pen)
+                    p.setBrush(QtGui.QBrush(QtCore.Qt.black))
+                    p.drawEllipse(QtCore.QPointF(q.x(), q.y()), 6, 6)
+
+                # line between them
+                px1 = x + self._vp_pts_rel[0][0] * w; py1 = y + self._vp_pts_rel[0][1] * h
+                px2 = x + self._vp_pts_rel[1][0] * w; py2 = y + self._vp_pts_rel[1][1] * h
+                q1 = self._proc_to_disp(px1, py1); q2 = self._proc_to_disp(px2, py2)
+                pen = QtGui.QPen(QtCore.Qt.white); pen.setWidth(1); p.setPen(pen)
+                p.drawLine(q1, q2)
         p.end()
         super().setPixmap(canvas)
 
@@ -70,17 +148,60 @@ class VideoLabel(QtWidgets.QLabel):
             if ev.button() == QtCore.Qt.LeftButton and self._last_draw_rect.contains(ev.pos()):
                 self._poly_pts.append(ev.pos()); self.update()
             elif ev.button() == QtCore.Qt.RightButton: self._finish_poly()
+        # NEW: start dragging VP handle if in define mode
+        if self._vp_mode and ev.button() == QtCore.Qt.LeftButton and self._vp_roi_proc is not None:
+            r = self._vp_roi_disp_rect()
+            if r is not None and r.contains(ev.pos()):
+                # pick nearest handle within radius
+                x, y, w, h = self._vp_roi_proc
+                cand = []
+                for i, (u, v) in enumerate(self._vp_pts_rel):
+                    px = x + u * w; py = y + v * h
+                    q = self._proc_to_disp(px, py)
+                    dx = ev.x() - q.x()
+                    dy = ev.y() - q.y()
+                    if (abs(dx) + abs(dy)) <= self._vp_hit_radius:  # manhattan radius
+                        cand.append(i)
+                    # or use Euclidean:
+                    # if (dx*dx + dy*dy) ** 0.5 <= self._vp_hit_radius:
+                        cand.append(i)
+                if cand:
+                    self._vp_drag_idx = cand[0]
+                    return  # swallow event (no super)
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev: QtGui.QMouseEvent):
         if self._rect_mode and not self._origin.isNull():
             self._rubber.setGeometry(QtCore.QRect(self._origin, ev.pos()).normalized())
+        # NEW: dragging
+        if self._vp_mode and self._vp_drag_idx in (0, 1) and self._vp_roi_proc is not None:
+            r = self._vp_roi_disp_rect()
+            if r is not None:
+                # clamp to ROI rect
+                cx = min(max(ev.x(), r.left()),  r.right())
+                cy = min(max(ev.y(), r.top()),   r.bottom())
+                # to proc
+                px, py = self._disp_to_proc_xy(QtCore.QPointF(cx, cy))
+                x, y, w, h = self._vp_roi_proc
+                if w > 0 and h > 0:
+                    u = (px - x) / float(w); v = (py - y) / float(h)
+                    u = min(max(u, 0.0), 1.0); v = min(max(v, 0.0), 1.0)
+                    self._vp_pts_rel[self._vp_drag_idx] = [u, v]
+                    self.update()
+                    # emit continuously while dragging
+                    self.vpPointsChanged.emit(self._vp_pts_rel[0], self._vp_pts_rel[1])
+            return
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev: QtGui.QMouseEvent):
         if self._rect_mode and ev.button() == QtCore.Qt.LeftButton:
             r = self._rubber.geometry(); self._rubber.hide(); self._rect_mode=False
             if r.width()>5 and r.height()>5: self.roiSelected.emit(r)
+        # NEW: stop dragging & emit final
+        if self._vp_mode and ev.button() == QtCore.Qt.LeftButton and self._vp_drag_idx in (0, 1):
+            self._vp_drag_idx = -1
+            self.vpPointsChanged.emit(self._vp_pts_rel[0], self._vp_pts_rel[1])
+            return
         super().mouseReleaseEvent(ev)
 
     def mouseDoubleClickEvent(self, ev):
@@ -349,6 +470,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_roi=None
         self._settings=QtCore.QSettings('vision_sdk','ui_client')
         self._log_buffer=[]
+        self._vp_rel1 = [0.25, 0.50]
+        self._vp_rel2 = [0.75, 0.50]
 
         # central: video + left controls (scroll)
         central=QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -408,7 +531,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_vp_init = QtWidgets.QPushButton("Define VPts")
         self.btn_vp_track = QtWidgets.QPushButton("Track VPts")
         self.btn_vp_track.setCheckable(True)
-        for w in (self.btn_vp_init, self.btn_vp_track): vh.addWidget(w)
+        self.btn_vp_stop = QtWidgets.QPushButton("Stop")
+        for w in (self.btn_vp_init, self.btn_vp_track, self.btn_vp_stop): vh.addWidget(w)
         left_v.addWidget(vp_box)
         # timer for tracking
         self._vp_timer = QtCore.QTimer(self); self._vp_timer.setInterval(120)  # ~8 Hz
@@ -509,13 +633,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_anchor.currentTextChanged.connect(lambda name: self._send({"type":"set_anchor_source","object":name}))
 
         # virtual points wiring
-        self.btn_vp_init.clicked.connect(self._vp_init)
+        self.btn_vp_init.clicked.connect(self._vp_define_mode)
         self.btn_vp_track.toggled.connect(self._vp_toggle)
         self._vp_timer.timeout.connect(lambda: self._send({"type":"run_measure",
                                                         "job":{"tool":"vp_step","params":{},"roi":self._last_roi},
                                                         "anchor":bool(self.chk_anchor.isChecked())}))
 
         self.btn_calib.clicked.connect(lambda: self._send({"type":"calibrate_one_click"}))
+
+        # define mode starts; tracking uses current VP rel points        # Stop button just turns tracking off and exits define mode
+        self.btn_vp_stop.clicked.connect(lambda: (self.btn_vp_track.setChecked(False),
+                                                  self.video.enable_vp_define(False)))
+        # keep your existing toggled/timeout connections as-is
+        # (we will override _vp_init to use draggable points)
+        self.video.vpPointsChanged.connect(self._vp_on_points_changed)
 
         self._ping=QtCore.QTimer(interval=10000,timeout=lambda: self._send({"type":"ping"}))
 
@@ -813,6 +944,8 @@ class MainWindow(QtWidgets.QMainWindow):
         qi=self._decode(msg.get("jpeg_b64","")); w=msg.get("w"); h=msg.get("h")
         if qi is None or w is None or h is None: return
         self.last_frame_wh=(int(w),int(h))
+        self.video.setFrameSize(self.last_frame_wh)
+
         now=time.perf_counter(); fps=1.0/max(1e-6,now-self._last_ts); self._last_ts=now
         self._fps_acc+=fps; self._fps_n+=1
         if self._fps_n>=10: self.lbl_fps.setText(f"FPS: {self._fps_acc/self._fps_n:.1f}"); self._fps_acc=0; self._fps_n=0
@@ -963,17 +1096,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _slot_state(self):
         self._send({"type":"set_slot_state","slot":int(self.cmb_slot.currentIndex()),"enabled":self.chk_en.isChecked(),"max_instances":int(self.sp_max.value())})
 
-    def _vp_init(self):
+    def _vp_define_mode(self):
+        """Enter define/drag mode on the current ROI with the last known rel points."""
+        roi = self._last_roi
+        if roi is None:
+            self.status.showMessage("Select a Rect ROI first", 3000); return
+        # show handles for dragging
+        self.video.enable_vp_define(True, roi_proc=roi, pts_rel=[self._vp_rel1, self._vp_rel2])
+        self.status.showMessage("Drag the two points inside the ROI. Click 'Track VPts' to start.", 4000)
+
+    def _vp_init_with_current_points(self):
+        """Send vp_init to server using current rel points (from dragging)."""
         roi = self._last_roi
         if roi is None:
             self.status.showMessage("Select a Rect ROI first", 3000); return
         x,y,w,h = roi
-        # Two default relative points (25% and 75% on the midline)
         params = {
-            "p1_rel": [0.25, 0.50],
-            "p2_rel": [0.75, 0.50],
+            "p1_rel": list(self._vp_rel1),
+            "p2_rel": list(self._vp_rel2),
             "patch_px": 21,
-            "search_px": max(41, int(min(w, h) * 0.5)),  # adapt search to ROI size
+            "search_px": max(41, int(min(w, h) * 0.5)),
             "update_alpha": 0.15,
             "conf_thr": 0.6
         }
@@ -987,6 +1129,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status.showMessage("Select a Rect ROI first", 3000)
                 self.btn_vp_track.setChecked(False)
                 return
+            # if define mode is on, keep it visible but we still init & track
+            self._vp_init_with_current_points()
             # Kick one step immediately, then start timer
             self._send({"type":"run_measure",
                         "job":{"tool":"vp_step","params":{},"roi":self._last_roi},
@@ -994,6 +1138,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._vp_timer.start()
         else:
             self._vp_timer.stop()
+            # also leave define mode so handles disappear
+            self.video.enable_vp_define(False)
 
     def _run_measure(self, tool: str):
         # Toggle off overlay if same tool clicked while showing measure overlay
@@ -1052,6 +1198,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try: self.ws.sendTextMessage(json.dumps(obj,separators=(',',':')))
         except Exception: pass
 
+    def _vp_on_points_changed(self, p1_rel, p2_rel):
+        # p*_rel are (u,v) in [0..1]
+        try:
+            self._vp_rel1 = [float(p1_rel[0]), float(p1_rel[1])]
+            self._vp_rel2 = [float(p2_rel[0]), float(p2_rel[1])]
+        except Exception:
+            pass
 
 def main():
     app=QtWidgets.QApplication(sys.argv)
