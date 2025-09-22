@@ -945,6 +945,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send({"type":"set_slot_state","slot":int(self.cmb_slot.currentIndex()),"enabled":self.chk_en.isChecked(),"max_instances":int(self.sp_max.value())})
 
     def _run_measure(self, tool: str):
+        # Toggle off overlay if same tool clicked while showing measure overlay
         if self._measure_overlay_active and self._last_measure_tool == tool:
             self._measure_overlay_active = False
             self._last_measure_tool = None
@@ -958,14 +959,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if roi is None:
             self.status.showMessage("Select a Rect ROI first", 3000)
             return
+
         self._pending_measure_tool = tool
         self._measure_overlay_active = False
-        job={"tool":tool,"params":{},"roi":roi}
-        x,y,w,h=roi
-        if tool=="point_pick": job["params"]={"hint_xy":[x+w*0.5,y+h*0.5]}
-        elif tool=="distance_p2p": job["params"]={"p1":[x,y+h*0.5],"p2":[x+w,y+h*0.5]}
-        elif tool=="distance_p2l": job["params"]={"pt":[x+w*0.5,y+h*0.5]}
-        self._send({"type":"run_measure","job":job,"anchor":bool(self.chk_anchor.isChecked())})
+
+        x, y, w, h = roi
+        # Adaptive window radius for point_pick
+        adaptive_r = max(2, min(8, min(w, h) // 4))
+
+        job = {"tool": tool, "params": {}, "roi": roi}
+
+        if tool == "point_pick":
+            job["params"] = {
+                "hint_xy": [x + w * 0.5, y + h * 0.5],
+                "win_radius": adaptive_r
+            }
+        elif tool == "distance_p2p":
+            job["params"] = {"p1": [x, y + h * 0.5], "p2": [x + w, y + h * 0.5]}
+        elif tool == "distance_p2l":
+            job["params"] = {"pt": [x + w * 0.5, y + h * 0.5]}
+        elif tool in ("line_fit", "line_caliper"):
+            # Keep your existing guides
+            job["tool"] = "line_caliper"
+            job["params"] = {
+                "p0": [x + 10, y + h * 0.5],
+                "p1": [x + w - 10, y + h * 0.5],
+                # optional defaults; server has sensible fallbacks
+                "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
+                "polarity": "any", "min_contrast": 8.0
+            }
+
+        self._send({"type": "run_measure", "job": job, "anchor": bool(self.chk_anchor.isChecked())})
 
     # ---- send ----
     def _send(self,obj):

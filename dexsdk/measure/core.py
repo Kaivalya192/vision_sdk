@@ -235,17 +235,54 @@ def run_job(frame_bgr: np.ndarray, job: Dict[str, Any], mm_per_px_xy: Tuple[floa
         return {"measures": measures, "units": units_label}, overlay
 
     elif tool == "point_pick":
-        # Simple gradient magnitude peak near a hint location, sub-pixel with centroid
+        # Robust point pick with adaptive window and empty-checks
         hint = params.get("hint_xy", [roi_img.shape[1]*0.5, roi_img.shape[0]*0.5])
         hx, hy = int(round(hint[0])), int(round(hint[1]))
-        r = int(params.get("win_radius", 8))
+        # Use requested radius but clamp to ROI size
+        req_r = int(params.get("win_radius", 8))
+        max_r = max(1, min(roi_img.shape[1] // 2 - 1, roi_img.shape[0] // 2 - 1))
+        r = max(1, min(req_r, max_r))
+
+        # If ROI is extremely small, fall back to center point display and exit
+        if roi_img.shape[0] < 3 or roi_img.shape[1] < 3 or max_r < 1:
+            P = (int(round(hx)) + rx, int(round(hy)) + ry)
+            cv2.circle(overlay, P, 3, (0, 255, 255), -1, cv2.LINE_AA)
+            _draw_text(overlay, "point_pick: ROI too small", (rx + 6, ry + 22), (0, 0, 255))
+            return {"measures": [], "units": units_label}, overlay
+
         x1, y1 = max(0, hx - r), max(0, hy - r)
         x2, y2 = min(roi_img.shape[1], hx + r + 1), min(roi_img.shape[0], hy + r + 1)
+
+        # Guard: ensure non-empty window
+        if x2 <= x1 or y2 <= y1:
+            # Try shrinking radius once
+            r = max(1, min(r - 1, max_r))
+            x1, y1 = max(0, hx - r), max(0, hy - r)
+            x2, y2 = min(roi_img.shape[1], hx + r + 1), min(roi_img.shape[0], hy + r + 1)
+
+        if x2 <= x1 or y2 <= y1:
+            P = (int(round(hx)) + rx, int(round(hy)) + ry)
+            cv2.circle(overlay, P, 3, (0, 255, 255), -1, cv2.LINE_AA)
+            _draw_text(overlay, "point_pick: invalid window", (rx + 6, ry + 22), (0, 0, 255))
+            return {"measures": [], "units": units_label}, overlay
+
         win = roi_gray[y1:y2, x1:x2]
+        if win.size == 0:
+            P = (int(round(hx)) + rx, int(round(hy)) + ry)
+            cv2.circle(overlay, P, 3, (0, 255, 255), -1, cv2.LINE_AA)
+            _draw_text(overlay, "point_pick: empty window", (rx + 6, ry + 22), (0, 0, 255))
+            return {"measures": [], "units": units_label}, overlay
+
         gx = cv2.Sobel(win, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(win, cv2.CV_32F, 0, 1, ksize=3)
         mag = cv2.magnitude(gx, gy)
-        m_sum = float(mag.sum()) + 1e-9
+        m_sum = float(mag.sum())
+        if m_sum <= 1e-9:
+            P = (int(round(hx)) + rx, int(round(hy)) + ry)
+            cv2.circle(overlay, P, 3, (0, 255, 255), -1, cv2.LINE_AA)
+            _draw_text(overlay, "point_pick: low gradient", (rx + 6, ry + 22), (0, 0, 255))
+            return {"measures": [], "units": units_label}, overlay
+
         ys, xs = np.mgrid[y1:y2, x1:x2]
         cx = (float((mag * xs).sum()) / m_sum)
         cy = (float((mag * ys).sum()) / m_sum)
