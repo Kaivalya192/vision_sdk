@@ -1,34 +1,13 @@
-"""Measurement core API and schema helpers.
+# dexsdk/measure/__init__.py
+"""
+Public API for dexsdk.measure
 
-This package provides:
-- Core types: MeasureContext, ResultPacket, Tool
-- A minimal registry: register(name, cls), get(name), registry_names()
-- Schema helpers to build standard result dictionaries
+We currently expose a single entry point:
+- run_job(frame_bgr, job_dict, (mm_per_px_x, mm_per_px_y), units_label="mm")
+
+If you need direct primitives, import from .tools (internal).
 """
 
-from .core import (
-    MeasureContext,
-    ResultPacket,
-    Tool,
-    register,
-    get,
-    registry_names,
-)
-from .schema import make_result, make_measure
-from .geometry import PointPick, LineFit, DistanceP2P  # noqa: F401
+from .core import run_job
 
-# Bind default tools into registry
-register("point_pick", PointPick)
-register("line_fit", LineFit)
-register("distance_p2p", DistanceP2P)
-
-__all__ = [
-    "MeasureContext",
-    "ResultPacket",
-    "Tool",
-    "register",
-    "get",
-    "registry_names",
-    "make_result",
-    "make_measure",
-]
+__all__ = ["run_job"]
