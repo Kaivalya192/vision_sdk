@@ -238,6 +238,14 @@ def run_job(frame_bgr: np.ndarray, job: Dict[str, Any], mm_per_px_xy: Tuple[floa
         # Robust point pick with adaptive window and empty-checks
         hint = params.get("hint_xy", [roi_img.shape[1]*0.5, roi_img.shape[0]*0.5])
         hx, hy = int(round(hint[0])), int(round(hint[1]))
+
+        # --- NEW: if hint looks global (outside ROI), convert to ROI-relative using rx,ry ---
+        if hx < 0 or hy < 0 or hx >= roi_img.shape[1] or hy >= roi_img.shape[0]:
+            gx, gy = hx - rx, hy - ry
+            if 0 <= gx < roi_img.shape[1] and 0 <= gy < roi_img.shape[0]:
+                hx, hy = int(gx), int(gy)
+        # -------------------------------------------------------------------------------
+
         # Use requested radius but clamp to ROI size
         req_r = int(params.get("win_radius", 8))
         max_r = max(1, min(roi_img.shape[1] // 2 - 1, roi_img.shape[0] // 2 - 1))

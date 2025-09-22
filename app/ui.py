@@ -964,27 +964,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self._measure_overlay_active = False
 
         x, y, w, h = roi
-        # Adaptive window radius for point_pick
+        # Adaptive window radius for point_pick; clamp to ROI size
         adaptive_r = max(2, min(8, min(w, h) // 4))
 
         job = {"tool": tool, "params": {}, "roi": roi}
 
+        # IMPORTANT: all params below are ROI-relative (not global)
         if tool == "point_pick":
             job["params"] = {
-                "hint_xy": [x + w * 0.5, y + h * 0.5],
+                "hint_xy": [w * 0.5, h * 0.5],
                 "win_radius": adaptive_r
             }
         elif tool == "distance_p2p":
-            job["params"] = {"p1": [x, y + h * 0.5], "p2": [x + w, y + h * 0.5]}
+            job["params"] = {
+                "p1": [0,       h * 0.5],
+                "p2": [w,       h * 0.5]
+            }
         elif tool == "distance_p2l":
-            job["params"] = {"pt": [x + w * 0.5, y + h * 0.5]}
+            job["params"] = {
+                "pt": [w * 0.5, h * 0.5]
+            }
         elif tool in ("line_fit", "line_caliper"):
-            # Keep your existing guides
             job["tool"] = "line_caliper"
             job["params"] = {
-                "p0": [x + 10, y + h * 0.5],
-                "p1": [x + w - 10, y + h * 0.5],
-                # optional defaults; server has sensible fallbacks
+                # simple guide across the ROI midline (ROI-relative)
+                "p0": [10,      h * 0.5],
+                "p1": [w - 10,  h * 0.5],
                 "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
                 "polarity": "any", "min_contrast": 8.0
             }
