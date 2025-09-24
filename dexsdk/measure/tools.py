@@ -51,10 +51,16 @@ def _extract_caliper_points(gray: np.ndarray, guide: CaliperGuide) -> Tuple[np.n
         ts = np.linspace(0.0, 1.0, guide.samples_per_scan).astype(np.float32)
         ray = _sample_along(ts, a, b)
         # bilinear sample
-        xs = np.clip(ray[:, 0], 0, w - 1)
-        ys = np.clip(ray[:, 1], 0, h - 1)
-        prof = cv2.remap(gray, xs.reshape(-1, 1), ys.reshape(-1, 1),
-                         interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        xs = np.clip(ray[:, 0], 0, w - 1).astype(np.float32)
+        ys = np.clip(ray[:, 1], 0, h - 1).astype(np.float32)
+        prof = cv2.remap(
+            gray,
+            xs.reshape(-1, 1),
+            ys.reshape(-1, 1),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
         prof = prof.flatten().astype(np.float32)
 
         # subpixel edge along 1D profile
@@ -131,10 +137,15 @@ def tool_circle_diameter(gray_roi: np.ndarray, prm: CircleParams) -> Tuple[Measu
     for k in range(prm.n_rays):
         ang = 2.0*np.pi * (k / prm.n_rays)
         dx, dy = np.cos(ang), np.sin(ang)
-        xs = np.clip(cx + radii * dx, 0, w - 1)
-        ys = np.clip(cy + radii * dy, 0, h - 1)
-        prof = cv2.remap(gray_roi, xs.reshape(-1, 1), ys.reshape(-1, 1),
-                         interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).flatten().astype(np.float32)
+        xs = np.clip(cx + radii * dx, 0, w - 1).astype(np.float32)
+        ys = np.clip(cy + radii * dy, 0, h - 1).astype(np.float32)
+        prof = cv2.remap(
+            gray_roi,
+            xs.reshape(-1, 1),
+            ys.reshape(-1, 1),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        ).flatten().astype(np.float32)
         pos, score, sign = subpix_edge_1d(prof, polarity=prm.polarity)
         if pos is None or score < prm.min_contrast:
             oks.append(False); pts.append([np.nan, np.nan]); continue
