@@ -1,85 +1,87 @@
+# d exsdk/measure/_subpix.py
 from __future__ import annotations
-
 from typing import Optional, Tuple
-
-import cv2
 import numpy as np
 
 
-def refine_corner_subpix(
-    gray: np.ndarray,
-    hint_xy: Tuple[float, float],
-    win_half: int = 7,
-    zero_zone: int = -1,
-) -> Tuple[float, float]:
-    """Refine a corner location to sub-pixel precision using cornerSubPix.
-
-    Parameters
-    - gray: 8-bit or float32 single-channel image
-    - hint_xy: initial (x, y) estimate in pixels
-    - win_half: half-size of the search window (7 -> 15x15 window)
-    - zero_zone: zeroZone for cornerSubPix (use -1 for disabled)
+def _parabolic_subpixel(y_m1: float, y_0: float, y_p1: float) -> float:
     """
-
-    if gray.ndim != 2:
-        raise ValueError("gray must be a single-channel image")
-
-    h, w = gray.shape[:2]
-    x0 = float(np.clip(hint_xy[0], 0, w - 1))
-    y0 = float(np.clip(hint_xy[1], 0, h - 1))
-
-    # cornerSubPix expects float32
-    if gray.dtype != np.float32:
-        g = gray.astype(np.float32)
-    else:
-        g = gray
-
-    pts = np.array([[[x0, y0]]], dtype=np.float32)
-    criteria = (
-        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-        50,
-        1e-2,
-    )
-    win_size = (int(win_half), int(win_half))
-    zero = (int(zero_zone), int(zero_zone))
-    refined = cv2.cornerSubPix(g, pts, win_size, zero, criteria)
-    x, y = refined[0, 0].tolist()
-    return float(x), float(y)
-
-
-def strongest_harris_corner(
-    gray: np.ndarray,
-    ksize: int = 3,
-    k: float = 0.04,
-    roi: Optional[Tuple[int, int, int, int]] = None,
-) -> Tuple[float, float]:
-    """Find the strongest Harris response point (x, y).
-
-    If roi is provided as (x, y, w, h), search is confined to that region.
+    3-point parabola vertex offset in samples relative to center point (i).
+    Returns delta in [-1, 1]. If denominator is near-zero, returns 0.0.
     """
-    if gray.ndim != 2:
-        raise ValueError("gray must be a single-channel image")
+    denom = (y_m1 - 2.0 * y_0 + y_p1)
+    if abs(denom) < 1e-12:
+        return 0.0
+    return 0.5 * (y_m1 - y_p1) / denom
 
-    h, w = gray.shape[:2]
-    x0, y0, ww, hh = (0, 0, w, h) if roi is None else roi
-    x1, y1 = x0 + ww, y0 + hh
-    x0 = max(0, x0)
-    y0 = max(0, y0)
-    x1 = min(w, x1)
-    y1 = min(h, y1)
 
-    patch = gray[y0:y1, x0:x1]
-    if patch.size == 0:
-        return float(w // 2), float(h // 2)
+def subpix_edge_1d(profile: np.ndarray, polarity: str = "any") -> Tuple[Optional[float], float, int]:
+    """
+    Sub-pixel edge locator along a 1D intensity profile.
 
-    if patch.dtype != np.float32:
-        g = patch.astype(np.float32)
-    else:
-        g = patch
+    Args:
+        profile: 1D array of intensities (0..255 or float). Shape (N,)
+        polarity: 'rising', 'falling', or 'any'
 
-    R = cv2.cornerHarris(g, blockSize=2, ksize=ksize, k=k)
-    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(R)
-    px = float(x0 + max_loc[0])
-    py = float(y0 + max_loc[1])
-    return px, py
+    Returns:
+        (pos, score, sign)
+        pos   : float index in [0, N-1] (None if failed)
+        score : edge strength (abs first-derivative at the peak)
+        sign  : +1 for rising, -1 for falling (0 if failed)
 
+    Notes:
+        - Uses a simple centered derivative and 3-point parabolic refinement.
+        - 'score' is in the same units as the derivative; you can compare it
+          to your contrast thresholds (e.g. 8.0, 12.0, …).
+    """
+    if profile is None:
+        return None, 0.0, 0
+    prof = np.asarray(profile, dtype=np.float32).flatten()
+    N = prof.size
+    if N < 3:
+        return None, 0.0, 0
+
+    # centered derivative ([-1, 0, +1] / 2) with clamped borders
+    # use np.gradient which does similar and handles edges
+    d = np.gradient(prof)
+    if polarity == "rising":
+        i = int(np.argmax(d))
+        sign = +1
+        peak_val = float(d[i])
+        if peak_val <= 0:
+            return None, 0.0, 0
+        y_m1, y_0, y_p1 = d[max(i - 1, 0)], d[i], d[min(i + 1, N - 1)]
+        delta = _parabolic_subpixel(y_m1, y_0, y_p1)
+        pos = float(i + np.clip(delta, -1.0, 1.0))
+        score = float(peak_val)
+        return pos, score, sign
+
+    elif polarity == "falling":
+        i = int(np.argmin(d))
+        sign = -1
+        peak_val = float(d[i])
+        if peak_val >= 0:
+            return None, 0.0, 0
+        y_m1, y_0, y_p1 = d[max(i - 1, 0)], d[i], d[min(i + 1, N - 1)]
+        delta = _parabolic_subpixel(y_m1, y_0, y_p1)
+        pos = float(i + np.clip(delta, -1.0, 1.0))
+        score = float(-peak_val)  # strength is magnitude
+        return pos, score, sign
+
+    else:  # 'any'
+        i_pos = int(np.argmax(d))
+        i_neg = int(np.argmin(d))
+        v_pos = float(d[i_pos])
+        v_neg = float(-d[i_neg])  # magnitude
+        if v_pos <= 0 and v_neg <= 0:
+            return None, 0.0, 0
+        if v_pos >= v_neg:
+            y_m1, y_0, y_p1 = d[max(i_pos - 1, 0)], d[i_pos], d[min(i_pos + 1, N - 1)]
+            delta = _parabolic_subpixel(y_m1, y_0, y_p1)
+            pos = float(i_pos + np.clip(delta, -1.0, 1.0))
+            return pos, float(v_pos), +1
+        else:
+            y_m1, y_0, y_p1 = d[max(i_neg - 1, 0)], d[i_neg], d[min(i_neg + 1, N - 1)]
+            delta = _parabolic_subpixel(y_m1, y_0, y_p1)
+            pos = float(i_neg + np.clip(delta, -1.0, 1.0))
+            return pos, float(v_neg), -1
