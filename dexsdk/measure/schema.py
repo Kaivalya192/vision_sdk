@@ -1,67 +1,66 @@
+# d exsdk/measure/schema.py
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Tuple, Literal, Dict, Any, Optional
 
-from typing import Any, Dict, List, Optional
+ToolName = Literal[
+    "line_caliper",        # fit a line with a 1D caliper band
+    "edge_pair_width",     # find two edges within a band → width
+    "angle_between",       # two calipers → angle
+    "circle_diameter",     # ring search → diameter
+]
 
+@dataclass
+class ROI:
+    x: int
+    y: int
+    w: int
+    h: int
 
-def _ensure_meta(meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    return {} if meta is None else dict(meta)
+@dataclass
+class CaliperGuide:
+    # ROI-relative guide endpoints (floats okay)
+    p0: Tuple[float, float]
+    p1: Tuple[float, float]
+    band_px: int = 24
+    n_scans: int = 32
+    samples_per_scan: int = 64
+    polarity: Literal["any", "rising", "falling"] = "any"
+    min_contrast: float = 8.0
 
+@dataclass
+class AngleBetween:
+    g1: CaliperGuide
+    g2: CaliperGuide
 
-def make_measure(
-    *,
-    id: str,
-    kind: str,
-    value: float,
-    sigma: Optional[float] = None,
-    passed: Optional[bool] = None,
-    meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Build a measure dict matching the schema.
+@dataclass
+class CircleParams:
+    # ring search, ROI-relative center and radius range
+    cx: float
+    cy: float
+    r_min: float
+    r_max: float
+    n_rays: int = 64
+    samples_per_ray: int = 64
+    polarity: Literal["any", "rising", "falling"] = "any"
+    min_contrast: float = 8.0
 
-    Returns a dictionary with keys:
-      - id: unique identifier for the measurement
-      - kind: type, e.g., "distance_p2p"
-      - value: numeric value (typically in millimeters)
-      - sigma: optional standard deviation
-      - pass: optional boolean pass/fail
-      - meta: optional dictionary with additional context
-    """
+@dataclass
+class Job:
+    tool: ToolName
+    roi: ROI
+    params: Dict[str, Any]
 
-    return {
-        "id": id,
-        "kind": kind,
-        "value": float(value),
-        "sigma": None if sigma is None else float(sigma),
-        "pass": passed,
-        "meta": _ensure_meta(meta),
-    }
+@dataclass
+class Measurement:
+    id: str
+    kind: str
+    value: float
+    sigma: float
+    passed: Optional[bool] = None
 
-
-def make_result(
-    *,
-    units: str = "mm",
-    measures: Optional[List[Dict[str, Any]]] = None,
-    primitives: Optional[Dict[str, Any]] = None,
-    version: str = "1.0",
-) -> Dict[str, Any]:
-    """Build a result dictionary with the standard shape.
-
-    Shape:
-    {
-      "version": "1.0",
-      "units": "mm",
-      "measures": [ ... ],
-      "primitives": { ... }
-    }
-    """
-
-    if units not in {"mm", "px"}:
-        raise ValueError("units must be either 'mm' or 'px'")
-
-    return {
-        "version": str(version),
-        "units": units,
-        "measures": [] if measures is None else list(measures),
-        "primitives": {} if primitives is None else dict(primitives),
-    }
-
+@dataclass
+class Packet:
+    units: str  # "px" or "mm"
+    measures: List[Measurement]
+    overlay: Optional[Any] = None   # cv2 BGR image for server rendering if needed

@@ -514,29 +514,26 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in (self.btn_rect,self.btn_poly,self.btn_clear): dh.addWidget(w)
         left_v.addWidget(det_box)
 
-        # Measure panel
-        meas_box=QtWidgets.QGroupBox("Measure"); mv=QtWidgets.QFormLayout(meas_box)
-        self.chk_anchor=QtWidgets.QCheckBox("Anchor ROI to detection")
-        self.cmb_anchor=QtWidgets.QComboBox(); self.cmb_anchor.setEditable(True); self.cmb_anchor.setEditText("Obj1")
-        hbM=QtWidgets.QHBoxLayout(); self.btn_pick=QtWidgets.QPushButton("Pick point"); self.btn_p2p=QtWidgets.QPushButton("P2P distance"); self.btn_fit=QtWidgets.QPushButton("Fit line"); self.btn_p2l=QtWidgets.QPushButton("Point → Line")
-        for w in (self.btn_pick,self.btn_p2p,self.btn_fit,self.btn_p2l): hbM.addWidget(w)
+        # Measure panel (REPLACEMENT — no point pick, no virtual points)
+        meas_box = QtWidgets.QGroupBox("Measure")
+        mv = QtWidgets.QFormLayout(meas_box)
+        self.chk_anchor = QtWidgets.QCheckBox("Anchor ROI to detection")
+        self.cmb_anchor = QtWidgets.QComboBox(); self.cmb_anchor.setEditable(True); self.cmb_anchor.setEditText("Obj1")
+
+        # Industrial tools
+        hbM = QtWidgets.QHBoxLayout()
+        self.btn_line   = QtWidgets.QPushButton("Line (caliper)")
+        self.btn_width  = QtWidgets.QPushButton("Width (edge pair)")
+        self.btn_angle  = QtWidgets.QPushButton("Angle (two calipers)")
+        self.btn_circle = QtWidgets.QPushButton("Circle Ø")
+        for w in (self.btn_line, self.btn_width, self.btn_angle, self.btn_circle):
+            hbM.addWidget(w)
+
         mv.addRow("Anchor source", self.cmb_anchor)
         mv.addRow(self.chk_anchor)
         mv.addRow(hbM)
         left_v.addWidget(meas_box)
-        
-        # --- Virtual Points (NEW) ---
-        vp_box = QtWidgets.QGroupBox("Virtual Points")
-        vh = QtWidgets.QHBoxLayout(vp_box)
-        self.btn_vp_init = QtWidgets.QPushButton("Define VPts")
-        self.btn_vp_track = QtWidgets.QPushButton("Track VPts")
-        self.btn_vp_track.setCheckable(True)
-        self.btn_vp_stop = QtWidgets.QPushButton("Stop")
-        for w in (self.btn_vp_init, self.btn_vp_track, self.btn_vp_stop): vh.addWidget(w)
-        left_v.addWidget(vp_box)
-        # timer for tracking
-        self._vp_timer = QtCore.QTimer(self); self._vp_timer.setInterval(120)  # ~8 Hz
-        # --- end Virtual Points ---
+
 
         # Detection settings
         det_cfg=QtWidgets.QGroupBox("Detection Settings")
@@ -624,32 +621,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.viewChanged.connect(lambda v: self._send({"type":"set_view",**v}))
         self.cam_panel.afTriggerRequested.connect(lambda: self._send({"type":"af_trigger"}))
         self.video.roiSelected.connect(self._rect_roi); self.video.polygonSelected.connect(self._poly_roi)
-
-        # measure wiring
-        self.btn_pick.clicked.connect(lambda: self._run_measure("point_pick"))
-        self.btn_fit.clicked.connect(lambda: self._run_measure("line_fit"))
-        self.btn_p2p.clicked.connect(lambda: self._run_measure("distance_p2p"))
-        self.btn_p2l.clicked.connect(lambda: self._run_measure("distance_p2l"))
-        self.cmb_anchor.currentTextChanged.connect(lambda name: self._send({"type":"set_anchor_source","object":name}))
-
-        # virtual points wiring
-        self.btn_vp_init.clicked.connect(self._vp_define_mode)
-        self.btn_vp_track.toggled.connect(self._vp_toggle)
-        self._vp_timer.timeout.connect(lambda: self._send({"type":"run_measure",
-                                                        "job":{"tool":"vp_step","params":{},"roi":self._last_roi},
-                                                        "anchor":bool(self.chk_anchor.isChecked())}))
-
-        self.btn_calib.clicked.connect(lambda: self._send({"type":"calibrate_one_click"}))
-
-        # define mode starts; tracking uses current VP rel points        # Stop button just turns tracking off and exits define mode
-        self.btn_vp_stop.clicked.connect(lambda: (self.btn_vp_track.setChecked(False),
-                                                  self.video.enable_vp_define(False)))
-        # keep your existing toggled/timeout connections as-is
-        # (we will override _vp_init to use draggable points)
-        self.video.vpPointsChanged.connect(self._vp_on_points_changed)
+        
+        # measure wiring (REPLACEMENT)
+        self.btn_line.clicked.connect (lambda: self._run_measure("line_caliper"))
+        self.btn_width.clicked.connect(lambda: self._run_measure("edge_pair_width"))
+        self.btn_angle.clicked.connect(lambda: self._run_measure("angle_between"))
+        self.btn_circle.clicked.connect(lambda: self._run_measure("circle_diameter"))
+        self.cmb_anchor.currentTextChanged.connect(
+            lambda name: self._send({"type":"set_anchor_source","object":name})
+        )
 
         self._ping=QtCore.QTimer(interval=10000,timeout=lambda: self._send({"type":"ping"}))
-
         self._load_settings()
 
     def eventFilter(self, obj, event):
@@ -1161,35 +1143,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self._measure_overlay_active = False
 
         x, y, w, h = roi
-        # Adaptive window radius for point_pick; clamp to ROI size
-        adaptive_r = max(2, min(8, min(w, h) // 4))
 
-        job = {"tool": tool, "params": {}, "roi": roi}
-
-        # IMPORTANT: all params below are ROI-relative (not global)
-        if tool == "point_pick":
-            job["params"] = {
-                "hint_xy": [w * 0.5, h * 0.5],
-                "win_radius": adaptive_r
-            }
-        elif tool == "distance_p2p":
-            job["params"] = {
-                "p1": [0,       h * 0.5],
-                "p2": [w,       h * 0.5]
-            }
-        elif tool == "distance_p2l":
-            job["params"] = {
-                "pt": [w * 0.5, h * 0.5]
-            }
-        elif tool in ("line_fit", "line_caliper"):
-            job["tool"] = "line_caliper"
-            job["params"] = {
-                # simple guide across the ROI midline (ROI-relative)
+        if tool == "line_caliper":
+            params = {
                 "p0": [10,      h * 0.5],
                 "p1": [w - 10,  h * 0.5],
                 "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
                 "polarity": "any", "min_contrast": 8.0
             }
+            job = {"tool": tool, "params": params, "roi": roi}
+
+        elif tool == "edge_pair_width":
+            g1 = {
+                "p0": [10,       h * 0.35],
+                "p1": [w - 10,   h * 0.35],
+                "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
+                "polarity": "any", "min_contrast": 8.0
+            }
+            g2 = {
+                "p0": [10,       h * 0.65],
+                "p1": [w - 10,   h * 0.65],
+                "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
+                "polarity": "any", "min_contrast": 8.0
+            }
+            job = {"tool": tool, "params": {"g1": g1, "g2": g2}, "roi": roi}
+
+        elif tool == "angle_between":
+            gH = {
+                "p0": [10,      h * 0.5],
+                "p1": [w - 10,  h * 0.5],
+                "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
+                "polarity": "any", "min_contrast": 8.0
+            }
+            gV = {
+                "p0": [w * 0.5, 10],
+                "p1": [w * 0.5, h - 10],
+                "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
+                "polarity": "any", "min_contrast": 8.0
+            }
+            job = {"tool": tool, "params": {"g1": gH, "g2": gV}, "roi": roi}
+
+        elif tool == "circle_diameter":
+            rmin = max(8.0, 0.15*min(w, h))
+            rmax = 0.48*min(w, h)
+            params = {
+                "cx": w * 0.5, "cy": h * 0.5,
+                "r_min": rmin, "r_max": rmax,
+                "n_rays": 64, "samples_per_ray": 64,
+                "polarity": "any", "min_contrast": 8.0
+            }
+            job = {"tool": tool, "params": params, "roi": roi}
+
+        else:
+            self.status.showMessage(f"Unknown tool {tool}", 3000)
+            return
 
         self._send({"type": "run_measure", "job": job, "anchor": bool(self.chk_anchor.isChecked())})
 

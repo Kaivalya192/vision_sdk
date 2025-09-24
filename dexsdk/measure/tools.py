@@ -1,121 +1,151 @@
-# dexsdk/measure/tools.py
-import math
+# d exsdk/measure/tools.py
+from __future__ import annotations
+from typing import Tuple, List, Optional, Dict, Any
 import numpy as np
 import cv2
 
-def _unit(v):
-    n = np.linalg.norm(v)
-    return v / max(n, 1e-9)
+from .schema import CaliperGuide, AngleBetween, CircleParams, Measurement, Packet, ROI
+from ._subpix import subpix_edge_1d  # already in your repo (kept)
+from .geometry import fit_line_total_least_squares, line_angle_deg, fit_circle_taubin  # keep or add if present
 
-def _quad_subpixel_peak(y, i):
-    # Parabolic interpolation of a 1D peak at integer i using neighbors i-1,i,i+1
-    if i <= 0 or i >= len(y)-1: 
-        return float(i)
-    a = 0.5 * (y[i+1] + y[i-1]) - y[i]
-    b = 0.5 * (y[i+1] - y[i-1])
-    if abs(a) < 1e-12: 
-        return float(i)
-    return float(i) - b / (2*a)
 
-def _sample_scanlines(gray, c0, c1, band_px=20, n_scans=24, samples_per_scan=64):
+def _clip_roi(img: np.ndarray, roi: ROI) -> np.ndarray:
+    H, W = img.shape[:2]
+    x = max(0, min(roi.x, W))
+    y = max(0, min(roi.y, H))
+    w = max(0, min(roi.w, W - x))
+    h = max(0, min(roi.h, H - y))
+    return img[y:y+h, x:x+w].copy()
+
+
+def _sample_along(normalized_t: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> np.ndarray:
+    # linear interpolate along guide
+    return (1.0 - normalized_t)[:, None] * p0[None, :] + normalized_t[:, None] * p1[None, :]
+
+
+def _extract_caliper_points(gray: np.ndarray, guide: CaliperGuide) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Sample intensity profiles orthogonal to the line c0->c1.
-    Returns sample grid points (x,y) and sampled intensity [n_scans, samples_per_scan].
+    Returns:
+      pts (N,2): subpixel edge points (x,y) in ROI coordinates
+      good_mask (N,): boolean
     """
     h, w = gray.shape[:2]
-    c0 = np.asarray(c0, dtype=np.float32)
-    c1 = np.asarray(c1, dtype=np.float32)
-    t  = _unit(c1 - c0)
-    n  = np.array([-t[1], t[0]], dtype=np.float32)  # normal
 
-    # centers of scanlines along the segment
-    L = np.linalg.norm(c1 - c0)
-    if L < 2:
-        raise ValueError("Segment too short")
-    us = np.linspace(0, 1, n_scans).astype(np.float32)
-    centers = c0[None,:] + (c1 - c0)[None,:] * us[:,None]
+    p0 = np.array(guide.p0, dtype=np.float32)
+    p1 = np.array(guide.p1, dtype=np.float32)
+    v = p1 - p0
+    L = np.linalg.norm(v) + 1e-6
+    t_scan = np.linspace(0.05, 0.95, guide.n_scans).astype(np.float32)
+    centers = _sample_along(t_scan, p0, p1)
 
-    # along-normal coords for each scan
-    vs = np.linspace(-band_px/2, band_px/2, samples_per_scan).astype(np.float32)
-    # broadcast to grid: [n_scans, samples_per_scan, 2]
-    pts = centers[:,None,:] + vs[None,:,None] * n[None,None,:]
-    map_x = pts[...,0].astype(np.float32)
-    map_y = pts[...,1].astype(np.float32)
+    # unit normal (perpendicular) to guide
+    n = np.array([-v[1], v[0]], dtype=np.float32) / L
+    half = max(1, int(guide.band_px // 2))
 
-    # bilinear sampling (use BORDER_REPLICATE for robustness)
-    prof = cv2.remap(gray, map_x, map_y, interpolation=cv2.INTER_LINEAR, 
-                     borderMode=cv2.BORDER_REPLICATE)
-    return pts, prof  # pts: [S,N,2], prof: [S,N]
+    pts = []
+    ok = []
+    for c in centers:
+        a = c - n * half
+        b = c + n * half
+        # sample intensity profile between a..b
+        ts = np.linspace(0.0, 1.0, guide.samples_per_scan).astype(np.float32)
+        ray = _sample_along(ts, a, b)
+        # bilinear sample
+        xs = np.clip(ray[:, 0], 0, w - 1)
+        ys = np.clip(ray[:, 1], 0, h - 1)
+        prof = cv2.remap(gray, xs.reshape(-1, 1), ys.reshape(-1, 1),
+                         interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        prof = prof.flatten().astype(np.float32)
 
-def _find_edge_positions_1d(profile, polarity='any', smooth_ksize=5):
-    """
-    Given 1D intensity, compute derivative and return peak index (sub-pixel).
-    polarity: 'rise', 'fall', or 'any'
-    """
-    if smooth_ksize >= 3:
-        profile = cv2.GaussianBlur(profile[None,None,:], (1, smooth_ksize|1), 0).ravel()
-    # Scharr/Sobel derivative along samples
-    grad = np.convolve(profile, [ -1, 0, +1 ], mode='same')
-    if polarity == 'rise':
-        i = int(np.argmax(grad))
-        return _quad_subpixel_peak(grad, i)
-    elif polarity == 'fall':
-        i = int(np.argmin(grad))
-        return _quad_subpixel_peak(-grad, i)  # flip so peak logic applies
-    else:
-        ip = int(np.argmax(grad))
-        ineg = int(np.argmin(grad))
-        # choose stronger edge by absolute gradient
-        return _quad_subpixel_peak(grad, ip) if abs(grad[ip]) >= abs(grad[ineg]) else _quad_subpixel_peak(-grad, ineg)
+        # subpixel edge along 1D profile
+        edge_pos, edge_score, edge_sign = subpix_edge_1d(prof, polarity=guide.polarity)
+        if edge_pos is None or edge_score < guide.min_contrast:
+            ok.append(False); pts.append([np.nan, np.nan]); continue
 
-def caliper_line(gray, p0, p1, band_px=20, n_scans=24, samples_per_scan=64, polarity='any', min_contrast=8.0):
-    """
-    Return sub-pixel edge points (x,y) along a band orthogonal to p0->p1 and a best-fit line.
-    """
-    gray = gray if gray.ndim == 2 else cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-    pts, prof = _sample_scanlines(gray, np.array(p0, np.float32), np.array(p1, np.float32),
-                                  band_px=band_px, n_scans=n_scans, samples_per_scan=samples_per_scan)
-    edge_xy = []
-    for s in range(prof.shape[0]):
-        p = prof[s]
-        # simple contrast check
-        if (p.max() - p.min()) < min_contrast: 
-            continue
-        u = _find_edge_positions_1d(p, polarity=polarity, smooth_ksize=5)  # sub-pixel sample index
-        # clamp
-        u = max(0.0, min(len(p)-1.0, u))
-        # interpolate 2D point at fractional index along the scanline
-        j = int(np.floor(u))
-        a = u - j
-        xy = (1.0 - a) * pts[s, j] + a * pts[s, min(j+1, pts.shape[1]-1)]
-        edge_xy.append(xy)
-    edge_xy = np.array(edge_xy, dtype=np.float32)
-    if len(edge_xy) < 5:
-        return {"ok": False, "msg": "not enough edges", "points": edge_xy}
+        # map back to XY
+        pt = a + (b - a) * float(edge_pos) / (guide.samples_per_scan - 1)
+        pts.append([float(pt[0]), float(pt[1])]); ok.append(True)
 
-    # best-fit line using PCA (robust & fast)
-    mean = edge_xy.mean(axis=0)
-    U, S, Vt = np.linalg.svd(edge_xy - mean, full_matrices=False)
-    dir_vec = Vt[0]  # principal direction
-    dir_vec = _unit(dir_vec)
-    normal = np.array([-dir_vec[1], dir_vec[0]], dtype=np.float32)
-    return {
-        "ok": True,
-        "points": edge_xy,
-        "line": {"point": mean.astype(float).tolist(), "dir": dir_vec.astype(float).tolist(), "normal": normal.astype(float).tolist()},
-    }
+    pts = np.array(pts, dtype=np.float32)
+    ok = np.array(ok, dtype=bool)
+    return pts, ok
 
-def distance_point_to_line(pt, line):
-    p = np.array(pt, np.float32)
-    p0 = np.array(line["point"], np.float32)
-    n  = np.array(line["normal"], np.float32)
-    return float(abs(np.dot(p - p0, n)))
 
-def distance_p2p(p1, p2):
-    p1 = np.array(p1, np.float32); p2 = np.array(p2, np.float32)
-    return float(np.linalg.norm(p2 - p1))
+def tool_line_caliper(gray_roi: np.ndarray, guide: CaliperGuide) -> Tuple[Measurement, Dict[str, Any]]:
+    pts, mask = _extract_caliper_points(gray_roi, guide)
+    good = pts[mask]
+    if len(good) < 5:
+        return Measurement(id="line_caliper", kind="line_angle_deg", value=float("nan"), sigma=float("inf")), {"pts": pts, "ok": mask}
 
-def angle_between_lines(line1, line2):
-    a = _unit(np.array(line1["dir"], np.float32)); b = _unit(np.array(line2["dir"], np.float32))
-    ang = math.degrees(math.atan2(a[0]*b[1] - a[1]*b[0], a[0]*b[0] + a[1]*b[1]))
-    return abs(ang)
+    # TLS line fit: ax + by + c = 0  (a^2 + b^2 = 1)
+    line = fit_line_total_least_squares(good)
+    ang = line_angle_deg(line)  # 0..180
+    # residuals: distance to line
+    a, b, c = line
+    d = np.abs(a * good[:, 0] + b * good[:, 1] + c)
+    sigma = float(np.std(d)) if len(d) > 1 else 0.0
+    return Measurement(id="line", kind="angle_deg", value=float(ang), sigma=sigma), {"pts": pts, "ok": mask, "line": line}
+
+
+def tool_edge_pair_width(gray_roi: np.ndarray, gA: CaliperGuide, gB: CaliperGuide) -> Tuple[Measurement, Dict[str, Any]]:
+    # extract points for each guide, then fit a line to each and compute shortest distance between them
+    mA, dbgA = tool_line_caliper(gray_roi, gA)
+    mB, dbgB = tool_line_caliper(gray_roi, gB)
+    lineA = dbgA.get("line"); lineB = dbgB.get("line")
+
+    if lineA is None or lineB is None or np.any(np.isnan(lineA)) or np.any(np.isnan(lineB)):
+        return Measurement(id="width", kind="px", value=float("nan"), sigma=float("inf")), {"A": dbgA, "B": dbgB}
+
+    # distance between (approximately parallel) lines: |c2 - c1| / sqrt(a^2 + b^2)
+    a1, b1, c1 = lineA; a2, b2, c2 = lineB
+    denom = np.sqrt(a1*a1 + b1*b1) + 1e-9
+    width = abs(c2 - c1) / denom
+    # rough sigma from residuals
+    sig = 0.5 * (mA.sigma + mB.sigma)
+    return Measurement(id="width", kind="px", value=float(width), sigma=float(sig)), {"A": dbgA, "B": dbgB}
+
+
+def tool_angle_between(gray_roi: np.ndarray, ab: AngleBetween) -> Tuple[Measurement, Dict[str, Any]]:
+    m1, d1 = tool_line_caliper(gray_roi, ab.g1)
+    m2, d2 = tool_line_caliper(gray_roi, ab.g2)
+    if np.isnan(m1.value) or np.isnan(m2.value):
+        return Measurement(id="angle", kind="deg", value=float("nan"), sigma=float("inf")), {"g1": d1, "g2": d2}
+
+    # angle between two (a,b) normals (or simply difference of angles)
+    ang = abs(m1.value - m2.value)
+    if ang > 90.0:
+        ang = 180.0 - ang
+    sig = 0.5 * (m1.sigma + m2.sigma)
+    return Measurement(id="angle", kind="deg", value=float(ang), sigma=float(sig)), {"g1": d1, "g2": d2}
+
+
+def tool_circle_diameter(gray_roi: np.ndarray, prm: CircleParams) -> Tuple[Measurement, Dict[str, Any]]:
+    h, w = gray_roi.shape[:2]
+    cx = float(np.clip(prm.cx, 0, w-1))
+    cy = float(np.clip(prm.cy, 0, h-1))
+    rays = []
+    radii = np.linspace(prm.r_min, prm.r_max, prm.samples_per_ray).astype(np.float32)
+
+    pts = []
+    oks = []
+    for k in range(prm.n_rays):
+        ang = 2.0*np.pi * (k / prm.n_rays)
+        dx, dy = np.cos(ang), np.sin(ang)
+        xs = np.clip(cx + radii * dx, 0, w - 1)
+        ys = np.clip(cy + radii * dy, 0, h - 1)
+        prof = cv2.remap(gray_roi, xs.reshape(-1, 1), ys.reshape(-1, 1),
+                         interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).flatten().astype(np.float32)
+        pos, score, sign = subpix_edge_1d(prof, polarity=prm.polarity)
+        if pos is None or score < prm.min_contrast:
+            oks.append(False); pts.append([np.nan, np.nan]); continue
+        r = float(radii[int(round(pos))])
+        pts.append([cx + r*dx, cy + r*dy]); oks.append(True)
+
+    pts = np.asarray(pts, dtype=np.float32)
+    mask = np.asarray(oks, dtype=bool)
+    good = pts[mask]
+    if len(good) < 8:
+        return Measurement(id="diameter", kind="px", value=float("nan"), sigma=float("inf")), {"pts": pts, "ok": mask}
+
+    (xc, yc, R), rmse = fit_circle_taubin(good)
+    return Measurement(id="diameter", kind="px", value=float(2.0*R), sigma=float(rmse)), {"pts": pts, "ok": mask, "circle": (xc, yc, R)}
