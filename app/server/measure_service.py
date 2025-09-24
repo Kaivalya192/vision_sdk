@@ -11,7 +11,6 @@ from dexsdk.measure.tools import (
     tool_circle_diameter,
 )
 from dexsdk.measure.schema import CaliperGuide, AngleBetween, CircleParams
-# Note: We construct the Packet as a plain dict; the UI expects a dict with keys it reads.
 
 
 def _to_gray(frame_bgr: np.ndarray) -> np.ndarray:
@@ -21,9 +20,6 @@ def _to_gray(frame_bgr: np.ndarray) -> np.ndarray:
 
 
 def _clip_roi_wh(frame: np.ndarray, roi: List[int]) -> Tuple[List[int], np.ndarray]:
-    """
-    Ensure ROI is inside the image; return (roi_xywh, roi_view_bgr)
-    """
     H, W = frame.shape[:2]
     if roi is None:
         return [0, 0, W, H], frame.copy()
@@ -40,9 +36,6 @@ def _clip_roi_wh(frame: np.ndarray, roi: List[int]) -> Tuple[List[int], np.ndarr
 
 
 def _draw_caliper_debug(overlay: np.ndarray, roi_xywh: List[int], dbg: Dict[str, Any], color_line=(0, 255, 255)):
-    """
-    Draw caliper sample points and fitted line on full-frame overlay.
-    """
     x0, y0, w, h = roi_xywh
     pts = dbg.get("pts")
     ok = dbg.get("ok")
@@ -57,20 +50,14 @@ def _draw_caliper_debug(overlay: np.ndarray, roi_xywh: List[int], dbg: Dict[str,
             cv2.circle(overlay, (cx, cy), 2, (0, 180, 255), -1)
 
     if line is not None and np.all(np.isfinite(line)):
-        # line: ax + by + c = 0
-        a, b, c = line
-        H, W = overlay.shape[:2]
-        # draw segment that spans the ROI width
-        # Find two points on the line within ROI bounds
-        # For x in [x0, x0+w]: y = -(a*x + c)/b  (if b!=0)
+        a, b, c = line  # ax + by + c = 0
         if abs(b) > 1e-9:
             xa = x0
             ya = int(round(-(a * xa + c) / b))
             xb = x0 + w
             yb = int(round(-(a * xb + c) / b))
             cv2.line(overlay, (xa, ya), (xb, yb), color_line, 2, cv2.LINE_AA)
-        else:
-            # vertical: x = -c/a
+        else:  # vertical
             xv = int(round(-c / a))
             cv2.line(overlay, (xv, y0), (xv, y0 + h), color_line, 2, cv2.LINE_AA)
 
@@ -88,59 +75,36 @@ class MeasureService:
     Minimal measurement service wrapper that exposes run_job(frame_bgr, job_dict)
     and returns (packet_dict, overlay_bgr_or_None).
     """
-    def __init__(self) -> None:
-        self.anchor = AnchorHelper()  # kept for compatibility
+    def __init__(self, get_mm_scale=None) -> None:
+        # server may pass _get_mm_scale() -> {"px_per_mm_x":..., "px_per_mm_y":...}
+        self._get_mm_scale = get_mm_scale
+        self.anchor = AnchorHelper()  # compatibility shim
 
-    # ------------------------------
-    # Public API expected by server:
-    # ------------------------------
     def run_job(self, frame_bgr: np.ndarray, job: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[np.ndarray]]:
-        """
-        Parameters
-        ----------
-        frame_bgr : np.ndarray
-            Full color frame (BGR).
-        job : dict
-            {
-              "tool": "line_caliper" | "edge_pair_width" | "angle_between" | "circle_diameter",
-              "params": {...},  # tool-specific
-              "roi": [x,y,w,h],
-              "anchor": bool (server passes separately, UI sends via h_set_anchor; we still accept)
-            }
-
-        Returns
-        -------
-        (packet_dict, overlay_bgr_or_None)
-        """
         tool = (job.get("tool") or "").lower()
         params = job.get("params", {}) or {}
         roi_in = job.get("roi") or [0, 0, frame_bgr.shape[1], frame_bgr.shape[0]]
 
-        # Apply anchoring transform (no-op in shim)
         roi_xywh = self.anchor.apply(roi_in, detection=None)
-
-        # Clip & extract ROI
         roi_xywh, roi_view_bgr = _clip_roi_wh(frame_bgr, roi_xywh)
         roi_gray = _to_gray(roi_view_bgr)
 
-        # Decide which tool to run
         if tool == "line_caliper":
             meas, dbg = self._run_line_caliper(roi_gray, params)
             overlay = _bgr_overlay(frame_bgr)
             _draw_caliper_debug(overlay, roi_xywh, dbg, color_line=(0, 255, 0))
-            packet = self._packet_from_measure(meas, units="px")
+            packet = self._packet_from_measure(meas, default_units="px")
             return packet, overlay
 
         elif tool == "edge_pair_width":
             meas, dbg = self._run_edge_pair_width(roi_gray, params)
             overlay = _bgr_overlay(frame_bgr)
-            # draw both debug bundles if present
             if isinstance(dbg, dict):
                 if "A" in dbg:
                     _draw_caliper_debug(overlay, roi_xywh, dbg["A"], color_line=(255, 200, 0))
                 if "B" in dbg:
                     _draw_caliper_debug(overlay, roi_xywh, dbg["B"], color_line=(0, 255, 255))
-            packet = self._packet_from_measure(meas, units="px")
+            packet = self._packet_from_measure(meas, default_units="px")
             return packet, overlay
 
         elif tool == "angle_between":
@@ -151,13 +115,12 @@ class MeasureService:
                     _draw_caliper_debug(overlay, roi_xywh, dbg["g1"], color_line=(0, 220, 255))
                 if "g2" in dbg:
                     _draw_caliper_debug(overlay, roi_xywh, dbg["g2"], color_line=(255, 0, 180))
-            packet = self._packet_from_measure(meas, units="deg")
+            packet = self._packet_from_measure(meas, default_units="deg")
             return packet, overlay
 
         elif tool == "circle_diameter":
             meas, dbg = self._run_circle_diameter(roi_gray, params)
             overlay = _bgr_overlay(frame_bgr)
-            # draw circle + points
             x0, y0, w, h = roi_xywh
             pts = dbg.get("pts")
             ok = dbg.get("ok")
@@ -171,12 +134,10 @@ class MeasureService:
             if circ is not None and np.all(np.isfinite(circ)):
                 xc, yc, R = circ
                 cv2.circle(overlay, (int(round(x0 + xc)), int(round(y0 + yc))), int(round(R)), (0, 255, 0), 2, cv2.LINE_AA)
-
-            packet = self._packet_from_measure(meas, units="px")
+            packet = self._packet_from_measure(meas, default_units="px")
             return packet, overlay
 
         else:
-            # Unknown tool → return NaN packet, no overlay
             packet = {
                 "measures": [{
                     "id": str(tool or "unknown"),
@@ -189,15 +150,12 @@ class MeasureService:
             }
             return packet, None
 
-    # ------------------------------
-    # Tool runners
-    # ------------------------------
+    # ---- tool runners ----
     def _run_line_caliper(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         g = _parse_caliper(params, gray_roi.shape)
         return tool_line_caliper(gray_roi, g)
 
     def _run_edge_pair_width(self, gray_roi: np.ndarray, params: Dict[str, Any]):
-        # Expect two guides in params: gA, gB (dicts)
         gA = _parse_caliper(params.get("gA", {}), gray_roi.shape)
         gB = _parse_caliper(params.get("gB", {}), gray_roi.shape)
         return tool_edge_pair_width(gray_roi, gA, gB)
@@ -212,17 +170,32 @@ class MeasureService:
         cp = _parse_circle_params(params, gray_roi.shape)
         return tool_circle_diameter(gray_roi, cp)
 
-    # ------------------------------
-    # Packet/overlay helpers
-    # ------------------------------
-    def _packet_from_measure(self, m, units: str = "px") -> Dict[str, Any]:
-        # m is dexsdk.measure.schema.Measurement (dataclass-like), but we convert to a dict the UI expects
+    # ---- packet / units helpers ----
+    def _packet_from_measure(self, m, default_units: str = "px") -> Dict[str, Any]:
+        val = float(getattr(m, "value", float("nan")))
+        sig = float(getattr(m, "sigma", float("nan")))
+        units = default_units
+
+        # Optional px->mm conversion if scale is available and default is px
+        if default_units == "px" and callable(self._get_mm_scale):
+            try:
+                ps = self._get_mm_scale() or {}
+                pxmmx = float(ps.get("px_per_mm_x", 0.0))
+                pxmmy = float(ps.get("px_per_mm_y", 0.0))
+                if pxmmx > 0 and pxmmy > 0:
+                    px_per_mm = 0.5 * (pxmmx + pxmmy)
+                    val /= px_per_mm
+                    sig /= px_per_mm
+                    units = "mm"
+            except Exception:
+                pass
+
         return {
             "measures": [{
                 "id": getattr(m, "id", "m"),
                 "kind": getattr(m, "kind", ""),
-                "value": float(getattr(m, "value", float("nan"))),
-                "sigma": float(getattr(m, "sigma", float("nan"))),
+                "value": val,
+                "sigma": sig,
                 "pass": getattr(m, "pass_", None) if hasattr(m, "pass_") else getattr(m, "pass", None),
             }],
             "units": units,
@@ -233,7 +206,6 @@ class MeasureService:
 
 def _parse_caliper(p: Dict[str, Any], roi_shape: Tuple[int, int]) -> CaliperGuide:
     h, w = roi_shape[:2]
-    # ROI-relative defaults: a horizontal guide across mid-height
     p0 = p.get("p0", [10.0, h * 0.5])
     p1 = p.get("p1", [max(10.0, w - 10.0), h * 0.5])
     band_px = int(p.get("band_px", 24))
@@ -271,13 +243,9 @@ def _parse_circle_params(p: Dict[str, Any], roi_shape: Tuple[int, int]) -> Circl
 
 
 # --- AnchorHelper shim (compatibility) ---------------------------------------
-# Some older server code imports AnchorHelper from this module.
-# This minimal version keeps behavior unchanged if you don't use anchoring.
-
 class AnchorHelper:
     """Compatibility shim. Tracks anchor source + enabled flag and
-    exposes an apply() that currently returns the ROI unchanged.
-    Replace with real pose/ROI transform if/when you need anchoring."""
+    exposes an apply() that currently returns the ROI unchanged."""
     def __init__(self) -> None:
         self._enabled: bool = False
         self._source: str | None = None
@@ -296,10 +264,6 @@ class AnchorHelper:
 
     def apply(self, roi: List[int] | Tuple[int, int, int, int],
               detection: Dict[str, Any] | None = None) -> List[int]:
-        """
-        Return ROI possibly transformed by the active anchor/detection.
-        This shim is a no-op: it just normalizes and returns the input ROI.
-        """
         if roi is None:
             return [0, 0, 0, 0]
         x, y, w, h = map(int, roi)
