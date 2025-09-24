@@ -253,136 +253,123 @@ class VisionServer:
             await r.send_acked(ws, msg)
 
         async def h_set_anchor_enabled(ws, msg: WSMessage):
-            self.measure.anchor.set_enabled(bool(msg.get("enabled", False)))
-            self.measure.anchor.reset_ref()
+            en = bool(msg.get("enabled", False))
+            # Be tolerant to different helper implementations
+            try:
+                self.anchor.set_enabled(en)
+            except AttributeError:
+                try:
+                    self.anchor._enabled = en  # fallback
+                except Exception:
+                    pass
             await r.send_acked(ws, msg)
 
         async def h_anchor_reset_ref(ws, msg: WSMessage):
-            self.measure.anchor.reset_ref()
-            await r.send_acked(ws, msg)
+            # Clear reference pose/ROI on server; next anchored request will recapture
+            ok = True
+            try:
+                # Some versions use reset_origin(), others reset_ref()
+                if hasattr(self.anchor, "reset_origin"):
+                    self.anchor.reset_origin()
+                elif hasattr(self.anchor, "reset_ref"):
+                    self.anchor.reset_ref()
+            except Exception:
+                ok = False
+            self._last_anchor_pose = None
+            await r.send_acked(ws, msg, ok=ok)
 
         r.register("set_anchor_source", h_set_anchor_source)
         r.register("set_anchor_enabled", h_set_anchor_enabled)
         r.register("anchor_reset_ref", h_anchor_reset_ref)
 
+        # ---- Run a measurement tool --------------------------------------
         async def h_run_measure(ws, msg: WSMessage):
+            """
+            msg: {
+              "job": {"tool": "...", "params": {...}, "roi": [x,y,w,h]},
+              "anchor": true|false
+            }
+            """
             job = msg.get("job", {}) or {}
             use_anchor = bool(msg.get("anchor", False))
+
             frame = self.last_proc_bgr.copy() if self.last_proc_bgr is not None else None
             if frame is None:
                 await r.send_acked(ws, msg, ok=False, error="no frame")
                 return
 
+            # Optional server-side anchoring (fixture)
+            roi = job.get("roi")
+            if use_anchor and roi is not None and self._last_anchor_pose is not None:
+                try:
+                    # Support both helper APIs
+                    if getattr(self.anchor, "origin_pose", None) is None and hasattr(self.anchor, "set_origin"):
+                        self.anchor.set_origin(self._last_anchor_pose, tuple(int(v) for v in roi))
+                    elif hasattr(self.anchor, "update"):
+                        self.anchor.update(self._last_anchor_pose)
+
+                    H, W = frame.shape[:2]
+                    if hasattr(self.anchor, "warp_rect"):
+                        new_roi = self.anchor.warp_rect(tuple(int(v) for v in (getattr(self.anchor, "base_rect", None) or tuple(roi))), W, H)
+                    else:
+                        # Fallback: if your AnchorHelper returns transformed ROI directly
+                        new_roi = getattr(self.anchor, "apply", lambda r, **_: r)(roi, use_anchor=True)
+                    job = {**job, "roi": list(map(int, new_roi))}
+                except Exception:
+                    # If anchoring fails, run with the original ROI
+                    pass
+
             loop = asyncio.get_running_loop()
 
             def _work():
-                return self.measure.run_job(frame, job, anchor=use_anchor)
+                # If your MeasureService.run_job has (frame, job, anchor=None), pass the flag:
+                try:
+                    return self.measure.run_job(frame, job, anchor=use_anchor)
+                except TypeError:
+                    # Older signature (frame, job)
+                    return self.measure.run_job(frame, job)
 
             packet, ov = await loop.run_in_executor(None, _work)
-            # Broadcast result
-            jpeg = await loop.run_in_executor(None, lambda: cv2.imencode(".jpg", ov, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes())
-            import base64
 
+            # Encode an overlay (fallback to frame if None)
+            ov_img = ov if ov is not None else frame
+            jpeg = await loop.run_in_executor(
+                None,
+                lambda: cv2.imencode(".jpg", ov_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes()
+            )
             b64 = base64.b64encode(jpeg).decode("ascii")
-            await self.stream.broadcast_json(self.clients, {"type": "measures", "packet": packet, "overlay_jpeg_b64": b64})
+
+            await self.stream.broadcast_json(self.clients, {
+                "type": "measures",
+                "packet": packet,
+                "overlay_jpeg_b64": b64
+            })
             await r.send_acked(ws, msg)
 
-        # ---- One-click calibration ---------------------------------------
-        async def h_calibrate(ws, msg: WSMessage):
-            await r.send_acked(ws, msg)
-            frame = self.last_proc_bgr.copy() if self.last_proc_bgr is not None else None
-            if frame is None:
-                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": False, "error": "no frame"})
-                return
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            loop = asyncio.get_running_loop()
+        r.register("run_measure", h_run_measure)
 
-            def _work():
-                intr = estimate_intrinsics(gray)
-                plane = compute_plane_scale(gray, K_json=None, cfg={"target_width": 0, "pair_weight": 0.5, "no_bias": False})
-                payload = {
-                    "model": intr.get("model"),
-                    "K": intr.get("K"),
-                    "dist": intr.get("dist"),
-                    "image_size": intr.get("image_size"),
-                    "rms_reprojection_error_px": intr.get("rms_reprojection_error_px"),
-                    "rmse_px": intr.get("rmse_px"),
-                    "plane_scale": plane.get("summary", {}).get("plane_scale", {}),
-                    "created_at_ms": int(time.time() * 1000),
-                }
-                # overlay: draw tag corners if present
-                ov = frame.copy()
-                for d in plane.get("detections", []):
-                    try:
-                        pts = d.get("corners_px")
-                        if pts is None:
-                            continue
-                        arr = np.array(pts, dtype=np.float32)
-                        if arr.ndim == 3:
-                            arr = arr.reshape(-1, 2)
-                        if arr.shape[0] >= 4:
-                            q = arr.astype(np.int32)
-                            cv2.polylines(ov, [q], True, (0, 255, 0), 2)
-                    except Exception:
-                        pass
-                ps = payload["plane_scale"]
-                pxmmx = ps.get("px_per_mm_x"); pxmmy = ps.get("px_per_mm_y")
-                mmppx = ps.get("mm_per_px_x"); mmppy = ps.get("mm_per_px_y")
-                txt = f"px/mm X={pxmmx:.3f} Y={pxmmy:.3f}\nmm/px X={mmppx:.5f} Y={mmppy:.5f}" if ps else "no plane scale"
-                y0 = 24
-                for i, line in enumerate(txt.split("\n")):
-                    cv2.putText(ov, line, (12, y0 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-                    cv2.putText(ov, line, (12, y0 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-                save_k_json(self._k_path, payload)
-                return payload, ov
+        # Ensure detections update the anchor pose
+        if detect_now:
+            overlay_bgr, objs, _ = self.detect.compute_all(bgr_small, draw=True)
 
+            # keep latest pose for the selected anchor object name
             try:
-                payload, ov = await loop.run_in_executor(None, _work)
-                jpeg = await loop.run_in_executor(None, lambda: cv2.imencode(".jpg", ov, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes())
-                b64 = base64.b64encode(jpeg).decode("ascii")
-                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": True, "saved": self._k_path, "summary": payload, "overlay_jpeg_b64": b64})
-            except Exception as e:
-                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": False, "error": str(e)})
-
-        r.register("calibrate_one_click", h_calibrate)
-
-        # ---- Robot calibration -------------------------------------------
-        async def h_robot_pairs(ws, msg: WSMessage):
-            op = str(msg.get("op", "")).lower()
-            if op == "add":
-                self.robot.add_pair(msg.get("robot", [0, 0]), msg.get("pixel", [0, 0]))
-                self.robot.save(self._robot_path)
-                await r.send_acked(ws, msg)
-            elif op == "clear":
-                self.robot.clear(); self.robot.save(self._robot_path)
-                await r.send_acked(ws, msg)
-            else:
-                await r.send_acked(ws, msg, ok=False, error="unknown op")
-
-        async def h_robot_solve(ws, msg: WSMessage):
-            loop = asyncio.get_running_loop()
-            try:
-                params = await loop.run_in_executor(None, self.robot.solve)
-                self.robot.save(self._robot_path)
-                await self.stream.broadcast_json(self.clients, {"type": "robot_calibration", "ok": True, "params": params})
-                await r.send_acked(ws, msg)
-            except Exception as e:
-                await self.stream.broadcast_json(self.clients, {"type": "robot_calibration", "ok": False, "error": str(e)})
-                await r.send_acked(ws, msg, ok=False, error=str(e))
-
-        async def h_robot_apply(ws, msg: WSMessage):
-            try:
-                px, py = msg.get("pixel", [0, 0])
-                rx, ry = self.robot.apply(float(px), float(py))
-                await self.stream.broadcast_json(self.clients, {"type": "robot_apply", "ok": True, "robot": [rx, ry]})
-                await r.send_acked(ws, msg)
-            except Exception as e:
-                await self.stream.broadcast_json(self.clients, {"type": "robot_apply", "ok": False, "error": str(e)})
-                await r.send_acked(ws, msg, ok=False, error=str(e))
-
-        r.register("robot_pairs", h_robot_pairs)
-        r.register("robot_solve", h_robot_solve)
-        r.register("robot_apply", h_robot_apply)
+                name_sel = getattr(self, "_anchor_name", "")
+                if name_sel:
+                    for o in objs:
+                        if o.get("name") == name_sel and o.get("detections"):
+                            pose = o["detections"][0].get("pose") or {}
+                            self._last_anchor_pose = {
+                                "x": float(pose.get("x", 0.0)),
+                                "y": float(pose.get("y", 0.0)),
+                                "theta_deg": float(pose.get("theta_deg", pose.get("theta", 0.0))),
+                            }
+                            # optional: continuously update helper if needed
+                            if hasattr(self.anchor, "update") and getattr(self.anchor, "origin_pose", None) is not None:
+                                self.anchor.update(self._last_anchor_pose)
+                            break
+            except Exception:
+                pass
 
     async def start(self):
         async with websockets.serve(
