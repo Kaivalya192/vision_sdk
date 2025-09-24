@@ -52,3 +52,36 @@ class MeasureService:
         if overlay_b64:
             out["overlay_jpeg_b64"] = overlay_b64
         return out
+
+class AnchorHelper:
+    """Compatibility shim. Tracks anchor source + enabled flag and
+    exposes an apply() that currently returns the ROI unchanged.
+    Replace with real pose/ROI transform if/when you need anchoring."""
+    def __init__(self) -> None:
+        self._enabled: bool = False
+        self._source: str | None = None
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+
+    def set_source(self, name: str | None) -> None:
+        self._source = name if isinstance(name, str) and name.strip() else None
+
+    def get_source(self) -> str | None:
+        return self._source
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def apply(self, roi: list[int] | tuple[int, int, int, int],
+              detection: dict | None = None) -> list[int]:
+        """
+        Return ROI possibly transformed by the active anchor/detection.
+        This shim is a no-op: it just normalizes and returns the input ROI.
+        """
+        if roi is None:
+            return [0, 0, 0, 0]
+        x, y, w, h = map(int, roi)
+        if w < 0: x, w = x + w, -w
+        if h < 0: y, h = y + h, -h
+        return [x, y, max(0, w), max(0, h)]
