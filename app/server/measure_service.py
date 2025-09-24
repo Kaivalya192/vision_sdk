@@ -80,12 +80,16 @@ class MeasureService:
         self._get_mm_scale = get_mm_scale
         self.anchor = AnchorHelper()  # compatibility shim
 
-    def run_job(self, frame_bgr: np.ndarray, job: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[np.ndarray]]:
+    def run_job(self, frame_bgr: np.ndarray, job: Dict[str, Any], anchor: Optional[bool] = None) -> Tuple[Dict[str, Any], Optional[np.ndarray]]:
         tool = (job.get("tool") or "").lower()
         params = job.get("params", {}) or {}
         roi_in = job.get("roi") or [0, 0, frame_bgr.shape[1], frame_bgr.shape[0]]
 
-        roi_xywh = self.anchor.apply(roi_in, detection=None)
+        # per-call anchor flag (default False if not provided)
+        anchor_flag = bool(anchor)
+        # transform ROI by current detection if fixture is enabled
+        roi_xywh = self.anchor.apply(roi_in, use_anchor=anchor_flag)
+
         roi_xywh, roi_view_bgr = _clip_roi_wh(frame_bgr, roi_xywh)
         roi_gray = _to_gray(roi_view_bgr)
 
@@ -241,32 +245,109 @@ def _parse_circle_params(p: Dict[str, Any], roi_shape: Tuple[int, int]) -> Circl
         polarity=polarity, min_contrast=min_con
     )
 
+# --- AnchorHelper (real fixture) --------------------------------------------
+def _rot2d(theta_deg: float) -> np.ndarray:
+    t = np.deg2rad(theta_deg)
+    c, s = np.cos(t), np.sin(t)
+    return np.array([[c, -s], [s, c]], dtype=np.float32)
 
-# --- AnchorHelper shim (compatibility) ---------------------------------------
 class AnchorHelper:
-    """Compatibility shim. Tracks anchor source + enabled flag and
-    exposes an apply() that currently returns the ROI unchanged."""
+    """
+    Cognex-style fixture. When enabled and a source name is set:
+      - the first time apply() is called with a ROI and a current detection pose,
+        we capture that as the reference (ref_pose, ref_roi).
+      - for subsequent frames, we rotate+translate ref_roi by the delta pose
+        (current_pose relative to ref_pose) and return the axis-aligned bbox.
+
+    Poses: (x, y, theta_deg) in image pixels / degrees.
+    """
     def __init__(self) -> None:
         self._enabled: bool = False
-        self._source: str | None = None
+        self._source: Optional[str] = None
+        self._curr_pose: Optional[Tuple[float, float, float]] = None
+        self._ref_pose: Optional[Tuple[float, float, float]] = None
+        self._ref_roi: Optional[List[int]] = None
 
+    # configuration
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
 
-    def set_source(self, name: str | None) -> None:
-        self._source = name if isinstance(name, str) and name.strip() else None
+    def set_source(self, name: Optional[str]) -> None:
+        self._source = name.strip() if isinstance(name, str) else None
 
-    def get_source(self) -> str | None:
+    def get_source(self) -> Optional[str]:
         return self._source
 
     def is_enabled(self) -> bool:
         return self._enabled
 
-    def apply(self, roi: List[int] | Tuple[int, int, int, int],
-              detection: Dict[str, Any] | None = None) -> List[int]:
+    def reset_ref(self) -> None:
+        self._ref_pose = None
+        self._ref_roi = None
+
+    # detection feed
+    def update_detections(self, objects: List[Dict[str, Any]]) -> None:
+        """Pick the best (highest score) detection for the configured source."""
+        self._curr_pose = None
+        if not self._source:
+            return
+        for obj in (objects or []):
+            if obj.get("name") != self._source:
+                continue
+            dets = obj.get("detections") or []
+            if not dets:
+                continue
+            det = max(dets, key=lambda d: float(d.get("score", 0.0)))
+            pose = det.get("pose") or {}
+            x = pose.get("x", det.get("x"))
+            y = pose.get("y", det.get("y"))
+            th = pose.get("theta_deg", pose.get("theta", 0.0))
+            if x is None or y is None:
+                c = det.get("center")
+                if isinstance(c, (list, tuple)) and len(c) >= 2:
+                    x, y = float(c[0]), float(c[1])
+            if x is None or y is None:
+                continue
+            self._curr_pose = (float(x), float(y), float(th or 0.0))
+            break
+        # nothing else to do here
+
+    # core
+    def apply(self, roi: List[int] | Tuple[int, int, int, int], use_anchor: bool) -> List[int]:
+        """Return transformed ROI [x,y,w,h]. If anchoring is disabled/unavailable, pass-through."""
         if roi is None:
             return [0, 0, 0, 0]
         x, y, w, h = map(int, roi)
         if w < 0: x, w = x + w, -w
         if h < 0: y, h = y + h, -h
-        return [x, y, max(0, w), max(0, h)]
+        roi_n = [x, y, max(0, w), max(0, h)]
+
+        if not (use_anchor and self._enabled and self._source and self._curr_pose):
+            # no anchoring -> pass-through
+            return roi_n
+
+        if self._ref_pose is None or self._ref_roi != roi_n:
+            # capture reference on first use (or when ROI changed)
+            self._ref_pose = self._curr_pose
+            self._ref_roi = roi_n
+            return roi_n
+
+        xr, yr, tr = self._ref_pose
+        xc, yc, tc = self._curr_pose
+        dtheta = tc - tr
+        R = _rot2d(dtheta)
+
+        # rotate & translate the 4 corners relative to ref pose center
+        x0, y0, w0, h0 = self._ref_roi
+        corners = np.array([[x0, y0],
+                            [x0 + w0, y0],
+                            [x0 + w0, y0 + h0],
+                            [x0, y0 + h0]], dtype=np.float32)
+        rel = corners - np.array([[xr, yr]], dtype=np.float32)  # N×2
+        warped = (rel @ R.T) + np.array([[xc, yc]], dtype=np.float32)
+
+        mn = np.min(warped, axis=0)
+        mx = np.max(warped, axis=0)
+        nx, ny = int(round(mn[0])), int(round(mn[1]))
+        nw, nh = int(round(mx[0] - mn[0])), int(round(mx[1] - mn[1]))
+        return [nx, ny, max(1, nw), max(1, nh)]

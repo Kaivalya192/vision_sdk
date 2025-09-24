@@ -514,11 +514,27 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in (self.btn_rect,self.btn_poly,self.btn_clear): dh.addWidget(w)
         left_v.addWidget(det_box)
 
-        # Measure panel (REPLACEMENT — no point pick, no virtual points)
+        # Measure panel (ANCHOR + industrial tools)
         meas_box = QtWidgets.QGroupBox("Measure")
         mv = QtWidgets.QFormLayout(meas_box)
+
+        # Anchor controls
+        self.cmb_anchor = QtWidgets.QComboBox()
+        self.cmb_anchor.setEditable(True)
+        self.cmb_anchor.setEditText("Obj1")
+        self.cmb_anchor.setToolTip("Detection object name to use as the fixture anchor")
+
         self.chk_anchor = QtWidgets.QCheckBox("Anchor ROI to detection")
-        self.cmb_anchor = QtWidgets.QComboBox(); self.cmb_anchor.setEditable(True); self.cmb_anchor.setEditText("Obj1")
+        self.chk_anchor.setToolTip("If enabled, the ROI will follow the selected detection pose")
+        self.btn_anchor_reset = QtWidgets.QPushButton("Reset")
+        self.btn_anchor_reset.setToolTip("Reset the anchor reference so next measurement re-captures it")
+
+        hb_anchor = QtWidgets.QHBoxLayout()
+        hb_anchor.addWidget(self.cmb_anchor, 1)
+        hb_anchor.addWidget(self.chk_anchor)
+        hb_anchor.addWidget(self.btn_anchor_reset)
+
+        mv.addRow("Anchor", hb_anchor)
 
         # Industrial tools
         hbM = QtWidgets.QHBoxLayout()
@@ -528,11 +544,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_circle = QtWidgets.QPushButton("Circle Ø")
         for w in (self.btn_line, self.btn_width, self.btn_angle, self.btn_circle):
             hbM.addWidget(w)
-
-        mv.addRow("Anchor source", self.cmb_anchor)
-        mv.addRow(self.chk_anchor)
         mv.addRow(hbM)
+
         left_v.addWidget(meas_box)
+
 
 
         # Detection settings
@@ -622,14 +637,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.afTriggerRequested.connect(lambda: self._send({"type":"af_trigger"}))
         self.video.roiSelected.connect(self._rect_roi); self.video.polygonSelected.connect(self._poly_roi)
         
-        # measure wiring (REPLACEMENT)
+        # measure wiring
         self.btn_line.clicked.connect (lambda: self._run_measure("line_caliper"))
         self.btn_width.clicked.connect(lambda: self._run_measure("edge_pair_width"))
         self.btn_angle.clicked.connect(lambda: self._run_measure("angle_between"))
         self.btn_circle.clicked.connect(lambda: self._run_measure("circle_diameter"))
+
+        # anchor wiring → server fixture
         self.cmb_anchor.currentTextChanged.connect(
-            lambda name: self._send({"type":"set_anchor_source","object":name})
+            lambda name: self._send({"type": "set_anchor_source", "object": name})
         )
+        self.chk_anchor.toggled.connect(
+            lambda on: self._send({"type": "set_anchor_enabled", "enabled": bool(on)})
+        )
+        self.btn_anchor_reset.clicked.connect(
+            lambda: self._send({"type": "anchor_reset_ref"})
+        )
+
 
         self._ping=QtCore.QTimer(interval=10000,timeout=lambda: self._send({"type":"ping"}))
         self._load_settings()
@@ -875,13 +899,24 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- websocket handlers ----
 
     def _ws_ok(self):
-        self.btn_conn.setEnabled(False); self.btn_disc.setEnabled(True); self._ping.start()
-        self._send({"type":"set_mode","mode":"training" if self.rad_train.isChecked() else "trigger"})
-        self._send({"type":"set_proc_width","width":int(self.cmb_w.currentText())})
-        self._send({"type":"set_publish_every","n":int(self.sp_every.value())})
+        self.btn_conn.setEnabled(False)
+        self.btn_disc.setEnabled(True)
+        self._ping.start()
+
+        # mode / processing
+        self._send({"type": "set_mode", "mode": "training" if self.rad_train.isChecked() else "trigger"})
+        self._send({"type": "set_proc_width", "width": int(self.cmb_w.currentText())})
+        self._send({"type": "set_publish_every", "n": int(self.sp_every.value())})
+
         # initial params/view
-        self.cam_panel._emit_params(); self.cam_panel._emit_view()
+        self.cam_panel._emit_params()
+        self.cam_panel._emit_view()
         self._emit_detection_settings()
+
+        # initial anchor state → server fixture
+        self._send({"type": "set_anchor_source", "object": self.cmb_anchor.currentText().strip()})
+        self._send({"type": "set_anchor_enabled", "enabled": bool(self.chk_anchor.isChecked())})
+
 
     def _ws_closed(self):
         self.btn_conn.setEnabled(True); self.btn_disc.setEnabled(False); self._ping.stop()

@@ -17,7 +17,7 @@ from .led_service import LEDClient, LEDStateMachine
 from .router import CommandRouter
 from .streamer import Streamer
 from .types import ViewConfig, WSMessage
-from .measure_service import MeasureService, AnchorHelper
+from .measure_service import MeasureService
 from .robot_calib import RobotMap
 from .calib_io import ensure_dir, save_k_json, load_k_json
 from dexsdk.calib.single_view_intrinsics import estimate_intrinsics
@@ -41,26 +41,10 @@ class VisionServer:
         self.detect = DetectService(max_slots=MAX_SLOTS, min_center_dist_px=40)
         self.stream = Streamer(jpeg_quality=JPEG_QUAL, prefer_b64=True)
         self.router = CommandRouter()
-        self.anchor = AnchorHelper()
-        self._anchor_name = ""
-        self._last_anchor_pose = None
-
-        def _get_mm_scale():
-            data = load_k_json(self._k_path) or {}
-            try:
-                ps = data.get("plane_scale") or {}
-                sx = float(ps.get("mm_per_px_x"))
-                sy = float(ps.get("mm_per_px_y"))
-                if sx > 0 and sy > 0:
-                    return (sx, sy), "mm"
-            except Exception:
-                pass
-            return (1.0, 1.0), "px"
-
         self._k_path = os.path.expanduser("~/.vision_sdk/K.json")
         self._robot_path = os.path.expanduser("~/.vision_sdk/robot_map.json")
         ensure_dir(os.path.dirname(self._k_path))
-        self.measure = MeasureService(_get_mm_scale)
+        self.measure = MeasureService(self._get_mm_scale)
         self.robot = RobotMap()
         # try load previous robot map
         try:
@@ -82,6 +66,17 @@ class VisionServer:
         self.led = LEDStateMachine(LEDClient(LED_HOST, LED_PORT), pre_ms=PRE_MS, post_ms=POST_MS)
 
         self._register_handlers()
+
+    def _get_mm_scale(self):
+        data = load_k_json(self._k_path) or {}
+        ps = (data.get("plane_scale") or {})
+        try:
+            return {
+                "px_per_mm_x": float(ps.get("px_per_mm_x", 0.0)),
+                "px_per_mm_y": float(ps.get("px_per_mm_y", 0.0)),
+            }
+        except Exception:
+            return {"px_per_mm_x": 0.0, "px_per_mm_y": 0.0}
 
     def _register_handlers(self):
         r = self.router
@@ -253,14 +248,22 @@ class VisionServer:
         r.register("af_trigger", h_af_trigger)
 
         async def h_set_anchor_source(ws, msg: WSMessage):
-            self._anchor_name = str(msg.get("object", "")).strip()
-            # reset origin and last pose when source changes
-            try:
-                self.anchor.reset_origin()
-            except Exception:
-                pass
-            self._last_anchor_pose = None
+            self.measure.anchor.set_source(str(msg.get("object", "")).strip())
+            self.measure.anchor.reset_ref()
             await r.send_acked(ws, msg)
+
+        async def h_set_anchor_enabled(ws, msg: WSMessage):
+            self.measure.anchor.set_enabled(bool(msg.get("enabled", False)))
+            self.measure.anchor.reset_ref()
+            await r.send_acked(ws, msg)
+
+        async def h_anchor_reset_ref(ws, msg: WSMessage):
+            self.measure.anchor.reset_ref()
+            await r.send_acked(ws, msg)
+
+        r.register("set_anchor_source", h_set_anchor_source)
+        r.register("set_anchor_enabled", h_set_anchor_enabled)
+        r.register("anchor_reset_ref", h_anchor_reset_ref)
 
         async def h_run_measure(ws, msg: WSMessage):
             job = msg.get("job", {}) or {}
@@ -269,21 +272,11 @@ class VisionServer:
             if frame is None:
                 await r.send_acked(ws, msg, ok=False, error="no frame")
                 return
-            # Apply anchoring if requested
-            roi = job.get("roi")
-            if use_anchor and roi is not None and self._last_anchor_pose is not None:
-                if self.anchor.origin_pose is None:
-                    self.anchor.set_origin(self._last_anchor_pose, tuple(int(v) for v in roi))
-                else:
-                    self.anchor.update(self._last_anchor_pose)
-                H, W = frame.shape[:2]
-                new_roi = self.anchor.warp_rect(tuple(int(v) for v in (self.anchor.base_rect or tuple(roi))), W, H)
-                job = {**job, "roi": list(new_roi)}
 
             loop = asyncio.get_running_loop()
 
             def _work():
-                return self.measure.run_job(frame, job)
+                return self.measure.run_job(frame, job, anchor=use_anchor)
 
             packet, ov = await loop.run_in_executor(None, _work)
             # Broadcast result
@@ -293,9 +286,6 @@ class VisionServer:
             b64 = base64.b64encode(jpeg).decode("ascii")
             await self.stream.broadcast_json(self.clients, {"type": "measures", "packet": packet, "overlay_jpeg_b64": b64})
             await r.send_acked(ws, msg)
-
-        r.register("set_anchor_source", h_set_anchor_source)
-        r.register("run_measure", h_run_measure)
 
         # ---- One-click calibration ---------------------------------------
         async def h_calibrate(ws, msg: WSMessage):
@@ -442,24 +432,8 @@ class VisionServer:
             objs: List[Dict] = []
             if detect_now:
                 overlay_bgr, objs, _ = self.detect.compute_all(bgr_small, draw=True)
-                # update anchor reference if selected present
                 try:
-                    name_sel = getattr(self, "_anchor_name", "")
-                    if name_sel:
-                        for o in objs:
-                            if o.get("name") == name_sel and o.get("detections"):
-                                # pick first
-                                pose = o["detections"][0].get("pose") or {}
-                                cur_pose = {
-                                    "x": float(pose.get("x", 0.0)),
-                                    "y": float(pose.get("y", 0.0)),
-                                    "theta_deg": float(pose.get("theta_deg", pose.get("theta", 0.0))),
-                                }
-                                self._last_anchor_pose = cur_pose
-                                # keep updating for origin-based anchoring
-                                if self.anchor.origin_pose is not None:
-                                    self.anchor.update(cur_pose)
-                                break
+                    self.measure.update_detections(objs)
                 except Exception:
                     pass
 
