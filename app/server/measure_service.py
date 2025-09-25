@@ -10,24 +10,24 @@ from dexsdk.measure.tools import (
     tool_angle_between,
     tool_circle_diameter,
 )
-from dexsdk.measure.schema import CaliperGuide, AngleBetween, CircleParams
+from dexsdk.measure.schema import LineROI, CaliperGuide, AngleBetween, CircleParams
 
-def _call_tool_optional_params(fn, *args):
+def _call_tool_optional_params(fn, *args, **kwargs):
     """
     Call dexsdk tool functions that may or may not require a trailing
-    'params' argument. Falls back to passing an empty dict.
+    'params' argument. Falls back to passing an empty dict, and also
+    tries keyword 'params' if required.
     """
     try:
-        return fn(*args)
+        return fn(*args, **kwargs)
     except TypeError as e:
-        # Newer dexsdk versions: ... missing required positional argument: 'params'
         if "params" in str(e):
             try:
-                return fn(*args, {})
+                return fn(*args, *(), {**kwargs.get("params", {})})
             except TypeError:
-                # try keyword, in case signature enforces name
-                return fn(*args, params={})
+                return fn(*args, **{**kwargs, "params": {}})
         raise
+
 
 def _to_gray(frame_bgr: np.ndarray) -> np.ndarray:
     if frame_bgr.ndim == 2:
@@ -169,22 +169,45 @@ class MeasureService:
                 "units": "px"
             }
             return packet, None
-        
-    # ---- tool runners ----
+       # ---- tool runners ----
     def _run_line_caliper(self, gray_roi: np.ndarray, params: Dict[str, Any]):
-        g = _parse_caliper(params, gray_roi.shape)
-        return _call_tool_optional_params(tool_line_caliper, gray_roi, g)
+        # Prefer LineROI API
+        lr = _parse_line_roi(params, gray_roi.shape)
+        try:
+            return tool_line_caliper(gray_roi, lr, {})
+        except TypeError:
+            # Older SDK: CaliperGuide-only
+            g = _parse_caliper(params, gray_roi.shape)
+            return _call_tool_optional_params(tool_line_caliper, gray_roi, g)
 
     def _run_edge_pair_width(self, gray_roi: np.ndarray, params: Dict[str, Any]):
-        gA = _parse_caliper(params.get("gA", {}), gray_roi.shape)
-        gB = _parse_caliper(params.get("gB", {}), gray_roi.shape)
-        return _call_tool_optional_params(tool_edge_pair_width, gray_roi, gA, gB)
+        # Prefer two LineROI arguments
+        pA = params.get("g1", params.get("gA", {}))
+        pB = params.get("g2", params.get("gB", {}))
+        lrA = _parse_line_roi(pA or {}, gray_roi.shape)
+        lrB = _parse_line_roi(pB or {}, gray_roi.shape)
+        try:
+            return tool_edge_pair_width(gray_roi, lrA, lrB, {})
+        except TypeError:
+            # Older SDK: two CaliperGuide + optional params
+            gA = _parse_caliper(pA or {}, gray_roi.shape)
+            gB = _parse_caliper(pB or {}, gray_roi.shape)
+            return _call_tool_optional_params(tool_edge_pair_width, gray_roi, gA, gB)
 
     def _run_angle_between(self, gray_roi: np.ndarray, params: Dict[str, Any]):
-        g1 = _parse_caliper(params.get("g1", {}), gray_roi.shape)
-        g2 = _parse_caliper(params.get("g2", {}), gray_roi.shape)
-        ab = AngleBetween(g1=g1, g2=g2)
-        return _call_tool_optional_params(tool_angle_between, gray_roi, ab)
+        # Prefer two LineROI arguments
+        p1 = params.get("g1", {})
+        p2 = params.get("g2", {})
+        lr1 = _parse_line_roi(p1, gray_roi.shape)
+        lr2 = _parse_line_roi(p2, gray_roi.shape)
+        try:
+            return tool_angle_between(gray_roi, lr1, lr2, {})
+        except TypeError:
+            # Older SDK: AngleBetween dataclass
+            g1 = _parse_caliper(p1, gray_roi.shape)
+            g2 = _parse_caliper(p2, gray_roi.shape)
+            ab = AngleBetween(g1=g1, g2=g2)
+            return _call_tool_optional_params(tool_angle_between, gray_roi, ab)
 
     def _run_circle_diameter(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         cp = _parse_circle_params(params, gray_roi.shape)
@@ -222,7 +245,6 @@ class MeasureService:
             "units": units,
         }
 
-
 # ---------- parsing helpers ----------
 
 def _parse_caliper(p: Dict[str, Any], roi_shape: Tuple[int, int]) -> CaliperGuide:
@@ -244,6 +266,28 @@ def _parse_caliper(p: Dict[str, Any], roi_shape: Tuple[int, int]) -> CaliperGuid
         min_contrast=min_con
     )
 
+def _parse_line_roi(p: Dict[str, Any], roi_shape: Tuple[int, int]) -> LineROI:
+    """
+    Convert old-style caliper params (p0, p1, band_px/ thickness) into LineROI.
+    - center = midpoint(p0, p1)
+    - length = |p1 - p0|
+    - angle = atan2(p1 - p0)
+    - thickness ≈ band_px   (reasonable mapping)
+    """
+    h, w = roi_shape[:2]
+    p0 = p.get("p0", [10.0, h * 0.5])
+    p1 = p.get("p1", [max(10.0, w - 10.0), h * 0.5])
+    band_px = float(p.get("band_px", 24.0))
+    x0, y0 = float(p0[0]), float(p0[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+
+    dx, dy = (x1 - x0), (y1 - y0)
+    length = float(max(20.0, (dx * dx + dy * dy) ** 0.5))
+    angle_deg = float(np.degrees(np.arctan2(dy, dx)))
+    cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+    thickness = max(5.0, float(band_px))
+
+    return LineROI(cx=cx, cy=cy, angle_deg=angle_deg, length=length, thickness=thickness)
 
 def _parse_circle_params(p: Dict[str, Any], roi_shape: Tuple[int, int]) -> CircleParams:
     h, w = roi_shape[:2]
