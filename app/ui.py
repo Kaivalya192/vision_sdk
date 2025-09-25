@@ -29,7 +29,13 @@ class VideoLabel(QtWidgets.QLabel):
         # --- VP define/drag state (NEW) ---
         self._frame_wh = (0, 0)              # (W,H) of original frame
         self._mode = None                    # None | 'caliper'
-        self._line_roi = None                # LineROI instance when in caliper mode
+        # interactive caliper define mode
+        self._line_roi = None         # stores the current LineROI from the view
+        self._line_params = None      # stores params {p0,p1,band_px,...} in ROI-local coords
+
+        self.tgl_define_line.toggled.connect(lambda on: self.video.enable_caliper_mode(on))
+        self.video.roiChanged.connect(self._on_line_roi_changed)
+
         self._last_result = None             # Last caliper measurement result
         self._vp_mode  = False               # define-mode on/off
         self._vp_roi_proc = None             # ROI in process/frame coords [x,y,w,h]
@@ -539,6 +545,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_buffer=[]
         self._vp_rel1 = [0.25, 0.50]
         self._vp_rel2 = [0.75, 0.50]
+        self._line_roi = None         # stores the current LineROI from the view
+        self._line_params = None      # stores params {p0,p1,band_px,...} in ROI-local coords
+
+        self.tgl_define_line.toggled.connect(lambda on: self.video.enable_caliper_mode(on))
+        self.video.roiChanged.connect(self._on_line_roi_changed)
 
         # central: video + left controls (scroll)
         central=QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -602,20 +613,24 @@ class MainWindow(QtWidgets.QMainWindow):
         hb_anchor.addWidget(self.btn_anchor_reset)
 
         mv.addRow("Anchor", hb_anchor)
-
         # Industrial tools
         hbM = QtWidgets.QHBoxLayout()
+
+        # NEW: toggle to define a line on the video
+        self.tgl_define_line = QtWidgets.QPushButton("Define Line ROI")
+        self.tgl_define_line.setCheckable(True)
+        self.tgl_define_line.setToolTip("Click to place the line center, drag to set length. Wheel = rotate, Alt+Wheel = thickness.")
+
         self.btn_line   = QtWidgets.QPushButton("Line (caliper)")
         self.btn_width  = QtWidgets.QPushButton("Width (edge pair)")
         self.btn_angle  = QtWidgets.QPushButton("Angle (two calipers)")
         self.btn_circle = QtWidgets.QPushButton("Circle Ø")
-        for w in (self.btn_line, self.btn_width, self.btn_angle, self.btn_circle):
+
+        for w in (self.tgl_define_line, self.btn_line, self.btn_width, self.btn_angle, self.btn_circle):
             hbM.addWidget(w)
         mv.addRow(hbM)
 
         left_v.addWidget(meas_box)
-
-
 
         # Detection settings
         det_cfg=QtWidgets.QGroupBox("Detection Settings")
@@ -734,6 +749,48 @@ class MainWindow(QtWidgets.QMainWindow):
                     action.setChecked(visible)
         return super().eventFilter(obj, event)
 
+    def _on_line_roi_changed(self, lr: LineROI):
+        """
+        Convert LineROI (in full-frame/proc coords) to old-style caliper params
+        relative to the currently selected Rect ROI (self._last_roi).
+        """
+        self._line_roi = lr
+        roi = self._last_roi
+        if roi is None:
+            # we can still keep a copy; but measurement requires a Rect ROI first
+            self._line_params = None
+            return
+
+        x0, y0, w, h = roi
+
+        # LineROI -> endpoints
+        a = math.radians(lr.angle_deg)
+        dx = 0.5 * lr.length * math.cos(a)
+        dy = 0.5 * lr.length * math.sin(a)
+
+        p0_abs = (lr.cx - dx, lr.cy - dy)
+        p1_abs = (lr.cx + dx, lr.cy + dy)
+
+        # Convert to ROI-local coordinates
+        p0 = [p0_abs[0] - x0, p0_abs[1] - y0]
+        p1 = [p1_abs[0] - x0, p1_abs[1] - y0]
+
+        # Clamp inside ROI just in case (not strictly necessary)
+        def _clamp(p):
+            return [max(0.0, min(float(w), float(p[0]))),
+                    max(0.0, min(float(h), float(p[1])))]
+        p0 = _clamp(p0)
+        p1 = _clamp(p1)
+
+        self._line_params = {
+            "p0": p0,
+            "p1": p1,
+            "band_px": float(max(5.0, lr.thickness)),
+            "n_scans": 32,
+            "samples_per_scan": 64,
+            "polarity": "any",
+            "min_contrast": 8.0,
+        }
 
 
     def closeEvent(self, event):
@@ -1247,12 +1304,17 @@ class MainWindow(QtWidgets.QMainWindow):
         x, y, w, h = roi
 
         if tool == "line_caliper":
-            params = {
-                "p0": [10,      h * 0.5],
-                "p1": [w - 10,  h * 0.5],
-                "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
-                "polarity": "any", "min_contrast": 8.0
-            }
+            # Prefer interactive definition if available
+            if self._line_params is not None:
+                params = dict(self._line_params)  # already ROI-local
+            else:
+                # Fallback: centered horizontal strip across ROI
+                params = {
+                    "p0": [10,      h * 0.5],
+                    "p1": [w - 10,  h * 0.5],
+                    "band_px": 24, "n_scans": 32, "samples_per_scan": 64,
+                    "polarity": "any", "min_contrast": 8.0
+                }
             job = {"tool": tool, "params": params, "roi": roi}
 
         elif tool == "edge_pair_width":
