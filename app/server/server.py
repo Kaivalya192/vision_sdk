@@ -328,9 +328,6 @@ class VisionServer:
             loop = asyncio.get_running_loop()
 
             def _work():
-                # Use the current frame
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
                 # 1) Intrinsics
                 intr = estimate_intrinsics(gray)
 

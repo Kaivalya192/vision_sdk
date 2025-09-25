@@ -650,7 +650,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Center video
         self.video=VideoLabel(); self.video.setMinimumSize(1024,576); self.video.setStyleSheet("background:#111;")
         self.tgl_define_line.toggled.connect(self.video.enable_caliper_mode)
-        
+        self.video.vpPointsChanged.connect(self._vp_on_points_changed)
         self.video.roiChanged.connect(self._on_line_roi_changed)
         
         root.addWidget(self.video, 1)
