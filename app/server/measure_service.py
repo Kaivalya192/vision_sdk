@@ -12,6 +12,31 @@ from dexsdk.measure.tools import (
 )
 from dexsdk.measure.schema import LineROI, CaliperGuide, AngleBetween, CircleParams
 
+def _normalize_measure_output(res):
+    """
+    Accepts results from dexsdk tools in any of these shapes and normalizes to (measure, debug):
+      - measure
+      - (measure, debug)
+      - (measure, debug, extra...)
+      - object with attribute .debug
+    """
+    # Tuple / list returns
+    if isinstance(res, (tuple, list)):
+        if len(res) == 0:
+            return None, {}
+        if len(res) == 1:
+            m = res[0]
+            dbg = getattr(m, "debug", {}) if m is not None else {}
+            return m, dbg
+        # len >= 2
+        m = res[0]
+        dbg = res[1] if res[1] is not None else {}
+        return m, dbg
+    # Single object return
+    m = res
+    dbg = getattr(res, "debug", {}) if res is not None else {}
+    return m, dbg
+
 def _call_tool_optional_params(fn, *args, **kwargs):
     """
     Call dexsdk tool functions that may or may not require a trailing
@@ -169,50 +194,54 @@ class MeasureService:
                 "units": "px"
             }
             return packet, None
-       # ---- tool runners ----
+    
+    # ---- tool runners ----
     def _run_line_caliper(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         # Prefer LineROI API
         lr = _parse_line_roi(params, gray_roi.shape)
         try:
-            return tool_line_caliper(gray_roi, lr, {})
+            res = tool_line_caliper(gray_roi, lr, {})
         except TypeError:
             # Older SDK: CaliperGuide-only
             g = _parse_caliper(params, gray_roi.shape)
-            return _call_tool_optional_params(tool_line_caliper, gray_roi, g)
+            res = _call_tool_optional_params(tool_line_caliper, gray_roi, g)
+        return _normalize_measure_output(res)
 
     def _run_edge_pair_width(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         # Prefer two LineROI arguments
-        pA = params.get("g1", params.get("gA", {}))
-        pB = params.get("g2", params.get("gB", {}))
-        lrA = _parse_line_roi(pA or {}, gray_roi.shape)
-        lrB = _parse_line_roi(pB or {}, gray_roi.shape)
+        pA = params.get("g1", params.get("gA", {})) or {}
+        pB = params.get("g2", params.get("gB", {})) or {}
+        lrA = _parse_line_roi(pA, gray_roi.shape)
+        lrB = _parse_line_roi(pB, gray_roi.shape)
         try:
-            return tool_edge_pair_width(gray_roi, lrA, lrB, {})
+            res = tool_edge_pair_width(gray_roi, lrA, lrB, {})
         except TypeError:
             # Older SDK: two CaliperGuide + optional params
-            gA = _parse_caliper(pA or {}, gray_roi.shape)
-            gB = _parse_caliper(pB or {}, gray_roi.shape)
-            return _call_tool_optional_params(tool_edge_pair_width, gray_roi, gA, gB)
+            gA = _parse_caliper(pA, gray_roi.shape)
+            gB = _parse_caliper(pB, gray_roi.shape)
+            res = _call_tool_optional_params(tool_edge_pair_width, gray_roi, gA, gB)
+        return _normalize_measure_output(res)
 
     def _run_angle_between(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         # Prefer two LineROI arguments
-        p1 = params.get("g1", {})
-        p2 = params.get("g2", {})
+        p1 = params.get("g1", {}) or {}
+        p2 = params.get("g2", {}) or {}
         lr1 = _parse_line_roi(p1, gray_roi.shape)
         lr2 = _parse_line_roi(p2, gray_roi.shape)
         try:
-            return tool_angle_between(gray_roi, lr1, lr2, {})
+            res = tool_angle_between(gray_roi, lr1, lr2, {})
         except TypeError:
             # Older SDK: AngleBetween dataclass
             g1 = _parse_caliper(p1, gray_roi.shape)
             g2 = _parse_caliper(p2, gray_roi.shape)
             ab = AngleBetween(g1=g1, g2=g2)
-            return _call_tool_optional_params(tool_angle_between, gray_roi, ab)
+            res = _call_tool_optional_params(tool_angle_between, gray_roi, ab)
+        return _normalize_measure_output(res)
 
     def _run_circle_diameter(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         cp = _parse_circle_params(params, gray_roi.shape)
-        return _call_tool_optional_params(tool_circle_diameter, gray_roi, cp)
-
+        res = _call_tool_optional_params(tool_circle_diameter, gray_roi, cp)
+        return _normalize_measure_output(res)
 
     # ---- packet / units helpers ----
     def _packet_from_measure(self, m, default_units: str = "px") -> Dict[str, Any]:
