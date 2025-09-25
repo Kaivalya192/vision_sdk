@@ -14,6 +14,10 @@ from PyQt5 import QtCore, QtGui, QtWidgets, QtWebSockets
 
 from dexsdk.measure.schema import LineROI
 from dexsdk.measure.drawing import draw_caliper_roi, draw_caliper_debug
+# --- calibration modules (your code) ---
+from dexsdk.calib.single_view_intrinsics import estimate_intrinsics as _estimate_intrinsics
+from dexsdk.calib.plane_scale import compute_plane_scale as _compute_plane_scale
+from dexsdk.calib.store import save_json as _save_json
 
 
 class VideoLabel(QtWidgets.QLabel):
@@ -32,10 +36,6 @@ class VideoLabel(QtWidgets.QLabel):
         # interactive caliper define mode
         self._line_roi = None         # stores the current LineROI from the view
         self._line_params = None      # stores params {p0,p1,band_px,...} in ROI-local coords
-
-        self.tgl_define_line.toggled.connect(lambda on: self.video.enable_caliper_mode(on))
-        self.video.roiChanged.connect(self._on_line_roi_changed)
-
         self._last_result = None             # Last caliper measurement result
         self._vp_mode  = False               # define-mode on/off
         self._vp_roi_proc = None             # ROI in process/frame coords [x,y,w,h]
@@ -197,8 +197,9 @@ class VideoLabel(QtWidgets.QLabel):
             self._line_roi = LineROI(cx=x, cy=y, angle_deg=0.0, length=120.0, thickness=15.0)
             self.roiChanged.emit(self._line_roi)
             self.update()
-
+            
     def mouseMoveEvent(self, ev: QtGui.QMouseEvent):
+        # 1) Caliper line drag
         if self._mode == "caliper" and ev.buttons() & QtCore.Qt.LeftButton and self._line_roi:
             x, y = self._disp_to_proc_xy(QtCore.QPointF(ev.pos()))
             dx = x - self._line_roi.cx
@@ -207,10 +208,30 @@ class VideoLabel(QtWidgets.QLabel):
             self._line_roi.angle_deg = math.degrees(math.atan2(dy, dx))
             self.roiChanged.emit(self._line_roi)
             self.update()
-        elif self._rect_mode and ev.buttons() & QtCore.Qt.LeftButton:
-            super().mouseMoveEvent(ev)
-            self._rubber.setGeometry(QtCore.QRect(self._origin, ev.pos()).normalized())
+            return
 
+        # 2) Rubber-band rectangle
+        if self._rect_mode and not self._origin.isNull():
+            self._rubber.setGeometry(QtCore.QRect(self._origin, ev.pos()).normalized())
+            return
+
+        # 3) VP handle dragging
+        if self._vp_mode and self._vp_drag_idx in (0, 1) and self._vp_roi_proc is not None:
+            r = self._vp_roi_disp_rect()
+            if r is not None:
+                cx = min(max(ev.x(), r.left()),  r.right())
+                cy = min(max(ev.y(), r.top()),   r.bottom())
+                px, py = self._disp_to_proc_xy(QtCore.QPointF(cx, cy))
+                x, y, w, h = self._vp_roi_proc
+                if w > 0 and h > 0:
+                    u = (px - x) / float(w); v = (py - y) / float(h)
+                    u = min(max(u, 0.0), 1.0); v = min(max(v, 0.0), 1.0)
+                    self._vp_pts_rel[self._vp_drag_idx] = [u, v]
+                    self.update()
+                    self.vpPointsChanged.emit(self._vp_pts_rel[0], self._vp_pts_rel[1])
+            return
+
+        super().mouseMoveEvent(ev)
     def wheelEvent(self, ev: QtGui.QWheelEvent):
         if self._mode == "caliper" and self._line_roi:
             if ev.modifiers() & QtCore.Qt.AltModifier:
@@ -219,52 +240,8 @@ class VideoLabel(QtWidgets.QLabel):
                 self._line_roi.angle_deg = (self._line_roi.angle_deg + (5 if ev.angleDelta().y() > 0 else -5)) % 180.0
             self.roiChanged.emit(self._line_roi)
             self.update()
-        else:
-            super().wheelEvent(ev)
-        # NEW: start dragging VP handle if in define mode
-        if self._vp_mode and ev.button() == QtCore.Qt.LeftButton and self._vp_roi_proc is not None:
-            r = self._vp_roi_disp_rect()
-            if r is not None and r.contains(ev.pos()):
-                # pick nearest handle within radius
-                x, y, w, h = self._vp_roi_proc
-                cand = []
-                for i, (u, v) in enumerate(self._vp_pts_rel):
-                    px = x + u * w; py = y + v * h
-                    q = self._proc_to_disp(px, py)
-                    dx = ev.x() - q.x()
-                    dy = ev.y() - q.y()
-                    if (abs(dx) + abs(dy)) <= self._vp_hit_radius:  # manhattan radius
-                        cand.append(i)
-                    # or use Euclidean:
-                    # if (dx*dx + dy*dy) ** 0.5 <= self._vp_hit_radius:
-                        cand.append(i)
-                if cand:
-                    self._vp_drag_idx = cand[0]
-                    return  # swallow event (no super)
-        super().mousePressEvent(ev)
-
-    def mouseMoveEvent(self, ev: QtGui.QMouseEvent):
-        if self._rect_mode and not self._origin.isNull():
-            self._rubber.setGeometry(QtCore.QRect(self._origin, ev.pos()).normalized())
-        # NEW: dragging
-        if self._vp_mode and self._vp_drag_idx in (0, 1) and self._vp_roi_proc is not None:
-            r = self._vp_roi_disp_rect()
-            if r is not None:
-                # clamp to ROI rect
-                cx = min(max(ev.x(), r.left()),  r.right())
-                cy = min(max(ev.y(), r.top()),   r.bottom())
-                # to proc
-                px, py = self._disp_to_proc_xy(QtCore.QPointF(cx, cy))
-                x, y, w, h = self._vp_roi_proc
-                if w > 0 and h > 0:
-                    u = (px - x) / float(w); v = (py - y) / float(h)
-                    u = min(max(u, 0.0), 1.0); v = min(max(v, 0.0), 1.0)
-                    self._vp_pts_rel[self._vp_drag_idx] = [u, v]
-                    self.update()
-                    # emit continuously while dragging
-                    self.vpPointsChanged.emit(self._vp_pts_rel[0], self._vp_pts_rel[1])
             return
-        super().mouseMoveEvent(ev)
+        super().wheelEvent(ev)
 
     def mouseReleaseEvent(self, ev: QtGui.QMouseEvent):
         if self._rect_mode and ev.button() == QtCore.Qt.LeftButton:
@@ -548,8 +525,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._line_roi = None         # stores the current LineROI from the view
         self._line_params = None      # stores params {p0,p1,band_px,...} in ROI-local coords
 
-        self.tgl_define_line.toggled.connect(lambda on: self.video.enable_caliper_mode(on))
-        self.video.roiChanged.connect(self._on_line_roi_changed)
+        self._px_per_mm_x = None
+        self._px_per_mm_y = None
+        self._K_last = None         
 
         # central: video + left controls (scroll)
         central=QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -620,7 +598,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tgl_define_line = QtWidgets.QPushButton("Define Line ROI")
         self.tgl_define_line.setCheckable(True)
         self.tgl_define_line.setToolTip("Click to place the line center, drag to set length. Wheel = rotate, Alt+Wheel = thickness.")
-
+        
         self.btn_line   = QtWidgets.QPushButton("Line (caliper)")
         self.btn_width  = QtWidgets.QPushButton("Width (edge pair)")
         self.btn_angle  = QtWidgets.QPushButton("Angle (two calipers)")
@@ -663,12 +641,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_calib=QtWidgets.QPushButton("Calibrate (1-click)")
         left_v.addWidget(self.btn_calib)
         left_v.addStretch(1)
+        # in MainWindow.__init__ after creating self.btn_calib
+        self.btn_calib.clicked.connect(lambda: self._send({"type": "calibrate_one_click"}))
 
         self.controlsPanel=QtWidgets.QScrollArea(); self.controlsPanel.setWidgetResizable(True); self.controlsPanel.setWidget(left_panel)
         root.addWidget(self.controlsPanel, 0)
 
         # Center video
         self.video=VideoLabel(); self.video.setMinimumSize(1024,576); self.video.setStyleSheet("background:#111;")
+        self.tgl_define_line.toggled.connect(self.video.enable_caliper_mode)
+        
+        self.video.roiChanged.connect(self._on_line_roi_changed)
+        
         root.addWidget(self.video, 1)
 
         # Results dock
@@ -748,6 +732,69 @@ class MainWindow(QtWidgets.QMainWindow):
                 if action.isChecked() != visible:
                     action.setChecked(visible)
         return super().eventFilter(obj, event)
+    
+    def _qimage_to_gray(self, qi: QtGui.QImage) -> Optional[np.ndarray]:
+        if qi is None or qi.isNull():
+            return None
+        qi = qi.convertToFormat(QtGui.QImage.Format_RGB888)
+        w, h = qi.width(), qi.height()
+        ptr = qi.bits()
+        ptr.setsize(qi.byteCount())
+        arr = np.frombuffer(ptr, np.uint8).reshape(h, w, 3)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        return gray
+
+    def _do_one_click_calib(self):
+        # Grab what we’re showing now (overlay if present; otherwise the latest frame)
+        qi = self._last_overlay_img if self._last_overlay_img is not None else None
+        if qi is None:
+            # fallback to last received frame: ask the label’s pixmap
+            pm = self.video.pixmap()
+            if pm is not None and not pm.isNull():
+                qi = pm.toImage()
+
+        if qi is None or qi.isNull():
+            QtWidgets.QMessageBox.warning(self, "Calibration", "No frame available yet. Connect and wait for a frame.")
+            return
+
+        gray = self._qimage_to_gray(qi)
+        if gray is None:
+            QtWidgets.QMessageBox.warning(self, "Calibration", "Could not convert frame to grayscale.")
+            return
+
+        try:
+            # 1) intrinsics from your single-view solver
+            intr = _estimate_intrinsics(gray)
+            self._K_last = intr
+            intr_path = str(_save_json("calib_intrinsics.json", intr))  # ~/.vim_rb/calib_intrinsics.json
+
+            # 2) plane scale (px/mm) with optional undistortion
+            plane = _compute_plane_scale(gray, intr_path, cfg={"target_width": 1200, "pair_weight": 0.5})
+            scale = plane.get("summary", {}).get("plane_scale", {})
+            self._px_per_mm_x = float(scale.get("px_per_mm_x", float("nan")))
+            self._px_per_mm_y = float(scale.get("px_per_mm_y", float("nan")))
+
+            _save_json("plane_scale.json", plane)  # keep a copy
+
+            # Update Calibration table
+            fx, fy = float(self._K_last["K"][0][0]), float(self._K_last["K"][1][1])
+            items = {
+                "model": self._K_last.get("model", "pinhole"),
+                "fx": f"{fx:.1f}",
+                "fy": f"{fy:.1f}",
+                "px/mm X": f"{self._px_per_mm_x:.6f}",
+                "px/mm Y": f"{self._px_per_mm_y:.6f}",
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self._fill_table(self.tbl_cal, items)
+            self._append_log("[calibration] local 1-click OK")
+
+            # Small toast
+            self.status.showMessage("Calibration complete. Measurements will show mm.", 4000)
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Calibration error", f"{type(e).__name__}: {e}")
+            self._append_log(f"[calibration] ERROR: {e}")
 
     def _on_line_roi_changed(self, lr: LineROI):
         """
@@ -1135,47 +1182,74 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _combo_items(self, cmb: QtWidgets.QComboBox):
         return [cmb.itemText(i) for i in range(cmb.count())]
-
-    # ---- measures/calibration ----
-    def _measures(self,msg:Dict):
-        pkt=msg.get("packet",{})
+    
+    def _measures(self, msg: Dict):
+        pkt = msg.get("packet", {})
         self._fill_table(self.tbl_meas, {})
-        meas=pkt.get("measures",[])
+        meas = pkt.get("measures", [])
         if meas:
-            m=meas[0]
-            items={
+            m = meas[0]
+            value = float(m.get("value", 0.0))
+            units = pkt.get("units", "px") or "px"
+
+            items = {
                 "id": m.get("id"),
                 "kind": m.get("kind"),
-                "value": f"{m.get('value',0.0):.3f}",
-                "units": pkt.get("units","px"),
+                "value": f"{value:.3f}",
+                "units": units,
                 "pass": m.get("pass"),
                 "sigma": m.get("sigma"),
             }
+
+            # robust mm conversion even if server doesn't give mm
+            if units.lower() in ("px", "pixel", "pixels"):
+                # choose a safe isotropic scale: mean of available axes
+                scales = []
+                for s in (self._px_per_mm_x, self._px_per_mm_y):
+                    if isinstance(s, (int, float)) and s and np.isfinite(s) and s > 0:
+                        scales.append(float(s))
+                if scales:
+                    px_per_mm = sum(scales) / len(scales)
+                    items["value_mm (derived)"] = f"{value / px_per_mm:.3f}"
+            elif units.lower() in ("mm", "millimeter", "millimeters"):
+                items["value_mm"] = f"{value:.3f}"
+
             self._fill_table(self.tbl_meas, items)
-            self._append_log(f"[measure] id={items['id']} kind={items['kind']} value={items['value']} {items['units']}")
+            self._append_log(f"[measure] id={items.get('id')} kind={items.get('kind')} value={items.get('value')} {units}")
+
+        # keep your overlay handling as-is ...
         if "overlay_jpeg_b64" in msg:
-            qi=self._decode(msg["overlay_jpeg_b64"])
+            qi = self._decode(msg["overlay_jpeg_b64"])
             if qi:
-                self._last_overlay_img=qi
-                self._overlay_mode='measure'
-                self._measure_overlay_active=True
-                self._overlay_until=0.0
+                self._last_overlay_img = qi
+                self._overlay_mode = 'measure'
+                self._measure_overlay_active = True
+                self._overlay_until = 0.0
                 if self._pending_measure_tool is not None:
-                    self._last_measure_tool=self._pending_measure_tool
+                    self._last_measure_tool = self._pending_measure_tool
                 self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
         if self._pending_measure_tool is not None:
             if not self._measure_overlay_active:
-                self._last_measure_tool=self._pending_measure_tool
-            self._pending_measure_tool=None
+                self._last_measure_tool = self._pending_measure_tool
+            self._pending_measure_tool = None
 
-    def _calib(self,msg:Dict):
-        ok=msg.get("ok",False)
+    def _calib(self, msg: Dict):
+        ok = msg.get("ok", False)
         if ok:
-            s=msg.get("summary",{})
-            K=s.get("K",[[0,0,0],[0,0,0],[0,0,1]])
-            fx=float(K[0][0]); fy=float(K[1][1])
-            ps=s.get("plane_scale",{})
-            items={
+            s = msg.get("summary", {})
+            K = s.get("K", [[0,0,0],[0,0,0],[0,0,1]])
+            fx = float(K[0][0]); fy = float(K[1][1])
+            ps = s.get("plane_scale", {}) or {}
+
+            # >>> NEW: cache scale so later px measurements show mm
+            try:
+                self._px_per_mm_x = float(ps.get("px_per_mm_x")) if ps.get("px_per_mm_x") is not None else None
+                self._px_per_mm_y = float(ps.get("px_per_mm_y")) if ps.get("px_per_mm_y") is not None else None
+            except Exception:
+                self._px_per_mm_x = self._px_per_mm_y = None
+            # <<<
+
+            items = {
                 "model": s.get("model",""),
                 "fx": f"{fx:.1f}",
                 "fy": f"{fy:.1f}",
@@ -1361,7 +1435,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.status.showMessage(f"Unknown tool {tool}", 3000)
             return
-
+        
         self._send({"type": "run_measure", "job": job, "anchor": bool(self.chk_anchor.isChecked())})
 
     # ---- send ----

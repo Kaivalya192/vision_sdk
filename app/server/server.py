@@ -271,13 +271,12 @@ class VisionServer:
         r.register("set_anchor_source", h_set_anchor_source)
         r.register("set_anchor_enabled", h_set_anchor_enabled)
         r.register("anchor_reset_ref", h_anchor_reset_ref)
-
-        # ---- Run a measurement tool --------------------------------------
+        
         async def h_run_measure(ws, msg: WSMessage):
             """
             msg: {
-              "job": {"tool": "...", "params": {...}, "roi": [x,y,w,h]},
-              "anchor": true|false
+            "job": {"tool": "...", "params": {...}, "roi": [x,y,w,h]},
+            "anchor": true|false
             }
             """
             job = msg.get("job", {}) or {}
@@ -291,18 +290,17 @@ class VisionServer:
             loop = asyncio.get_running_loop()
 
             def _work():
-                # Preferred signature (frame, job, anchor=...)
+                # Preferred signature: (frame, job, anchor=...)
                 return self.measure.run_job(frame, job, anchor=use_anchor)
 
             try:
                 packet, ov = await loop.run_in_executor(None, _work)
             except TypeError:
-                # Backwards-compat: older MeasureService without 'anchor' arg
+                # Back-compat: older MeasureService without 'anchor'
                 def _work_old():
                     return self.measure.run_job(frame, job)
                 packet, ov = await loop.run_in_executor(None, _work_old)
 
-            # Encode overlay (fallback to frame)
             ov_img = ov if ov is not None else frame
             jpeg = await loop.run_in_executor(
                 None,
@@ -330,41 +328,50 @@ class VisionServer:
             loop = asyncio.get_running_loop()
 
             def _work():
+                # Use the current frame
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                # 1) Intrinsics
                 intr = estimate_intrinsics(gray)
-                plane = compute_plane_scale(
-                    gray, K_json=None,
-                    cfg={"target_width": 0, "pair_weight": 0.5, "no_bias": False}
-                )
-                payload = {
+
+                # Write K/dist immediately so plane_scale can undistort
+                k_only = {
                     "model": intr.get("model"),
                     "K": intr.get("K"),
                     "dist": intr.get("dist"),
                     "image_size": intr.get("image_size"),
+                    "created_at_ms": int(time.time() * 1000),
+                }
+                save_k_json(self._k_path, k_only)
+
+                # 2) Plane scale with undistortion
+                plane = compute_plane_scale(
+                    gray,
+                    K_json=self._k_path,
+                    cfg={"target_width": 0, "pair_weight": 0.5, "no_bias": False}
+                )
+
+                payload = {
+                    **k_only,
                     "rms_reprojection_error_px": intr.get("rms_reprojection_error_px"),
                     "rmse_px": intr.get("rmse_px"),
                     "plane_scale": plane.get("summary", {}).get("plane_scale", {}),
-                    "created_at_ms": int(time.time() * 1000),
                 }
-                # overlay: draw tag corners if present
+
+                # 3) Overlay: tag outlines + text
                 ov = frame.copy()
                 for d in plane.get("detections", []):
                     try:
-                        pts = d.get("corners_px")
-                        if not pts:
-                            continue
-                        arr = np.array(pts, dtype=np.float32).reshape(-1, 2)
+                        arr = np.array(d.get("corners_px", []), dtype=np.float32).reshape(-1, 2)
                         if arr.shape[0] >= 4:
-                            q = arr.astype(np.int32)
-                            cv2.polylines(ov, [q], True, (0, 255, 0), 2)
+                            cv2.polylines(ov, [arr.astype(np.int32)], True, (0, 255, 0), 2)
                     except Exception:
                         pass
-                # draw plane scale text if available
-                ps = payload["plane_scale"] or {}
+
+                ps = payload.get("plane_scale") or {}
                 try:
-                    pxmmx = ps.get("px_per_mm_x"); pxmmy = ps.get("px_per_mm_y")
-                    mmppx = ps.get("mm_per_px_x"); mmppy = ps.get("mm_per_px_y")
-                    txt = (f"px/mm X={pxmmx:.3f} Y={pxmmy:.3f}\n"
-                            f"mm/px X={mmppx:.5f} Y={mmppy:.5f}") if ps else "no plane scale"
+                    txt = (f"px/mm X={ps['px_per_mm_x']:.3f} Y={ps['px_per_mm_y']:.3f}\n"
+                        f"mm/px X={ps['mm_per_px_x']:.5f} Y={ps['mm_per_px_y']:.5f}")
                 except Exception:
                     txt = "no plane scale"
                 y0 = 24
@@ -372,8 +379,10 @@ class VisionServer:
                     cv2.putText(ov, line, (12, y0 + 24*i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 3, cv2.LINE_AA)
                     cv2.putText(ov, line, (12, y0 + 24*i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
 
+                # Save final combined JSON (K + plane_scale)
                 save_k_json(self._k_path, payload)
                 return payload, ov
+
 
             try:
                 payload, ov = await loop.run_in_executor(None, _work)
