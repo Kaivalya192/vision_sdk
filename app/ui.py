@@ -9,13 +9,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 
+import math
 from PyQt5 import QtCore, QtGui, QtWidgets, QtWebSockets
+
+from dexsdk.measure.schema import LineROI
+from dexsdk.measure.drawing import draw_caliper_roi, draw_caliper_debug
 
 
 class VideoLabel(QtWidgets.QLabel):
     roiSelected      = QtCore.pyqtSignal(QtCore.QRect)
     polygonSelected  = QtCore.pyqtSignal(object)            # list[QPoint]
     vpPointsChanged  = QtCore.pyqtSignal(object, object)
+    roiChanged      = QtCore.pyqtSignal(object)            # LineROI
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -23,6 +28,9 @@ class VideoLabel(QtWidgets.QLabel):
         self._last_draw_rect = QtCore.QRect()
         # --- VP define/drag state (NEW) ---
         self._frame_wh = (0, 0)              # (W,H) of original frame
+        self._mode = None                    # None | 'caliper'
+        self._line_roi = None                # LineROI instance when in caliper mode
+        self._last_result = None             # Last caliper measurement result
         self._vp_mode  = False               # define-mode on/off
         self._vp_roi_proc = None             # ROI in process/frame coords [x,y,w,h]
         self._vp_pts_rel  = [[0.25, 0.5], [0.75, 0.5]]  # u,v in [0..1] inside ROI
@@ -126,6 +134,26 @@ class VideoLabel(QtWidgets.QLabel):
                 q1 = self._proc_to_disp(px1, py1); q2 = self._proc_to_disp(px2, py2)
                 pen = QtGui.QPen(QtCore.Qt.white); pen.setWidth(1); p.setPen(pen)
                 p.drawLine(q1, q2)
+        # Draw caliper ROI
+        if self._mode == "caliper" and self._line_roi:
+            pen = QtGui.QPen(QtCore.Qt.yellow); pen.setWidth(2); p.setPen(pen)
+            # Draw center point
+            cx = self._proc_to_disp(self._line_roi.cx, self._line_roi.cy)
+            p.drawEllipse(cx, 4, 4)
+            # Draw direction and thickness handles
+            a = math.radians(self._line_roi.angle_deg)
+            dx = self._line_roi.length * 0.5 * np.array([math.cos(a), math.sin(a)])
+            nx = self._line_roi.thickness * 0.5 * np.array([-math.sin(a), math.cos(a)])
+            for d in [dx, -dx]:
+                p1 = self._proc_to_disp(self._line_roi.cx + d[0], self._line_roi.cy + d[1])
+                for n in [nx, -nx]:
+                    p2 = self._proc_to_disp(self._line_roi.cx + d[0] + n[0],
+                                          self._line_roi.cy + d[1] + n[1])
+                    p.drawLine(p1, p2)
+            # Draw length line
+            p1 = self._proc_to_disp(self._line_roi.cx + dx[0], self._line_roi.cy + dx[1])
+            p2 = self._proc_to_disp(self._line_roi.cx - dx[0], self._line_roi.cy - dx[1])
+            p.drawLine(p1, p2)
         p.end()
         super().setPixmap(canvas)
 
@@ -138,8 +166,18 @@ class VideoLabel(QtWidgets.QLabel):
     def enable_polygon_selection(self, ok: bool):
         self._poly_mode = ok
         self._rect_mode = False
+        self._mode = None
         self._poly_pts.clear()
         if not ok: self.update()
+
+    def enable_caliper_mode(self, enable: bool):
+        self._mode = "caliper" if enable else None
+        self._rect_mode = False
+        self._poly_mode = False
+        self._poly_pts.clear()
+        if not enable:
+            self._line_roi = None
+        self.update()
 
     def mousePressEvent(self, ev: QtGui.QMouseEvent):
         if self._rect_mode and ev.button() == QtCore.Qt.LeftButton:
@@ -148,6 +186,35 @@ class VideoLabel(QtWidgets.QLabel):
             if ev.button() == QtCore.Qt.LeftButton and self._last_draw_rect.contains(ev.pos()):
                 self._poly_pts.append(ev.pos()); self.update()
             elif ev.button() == QtCore.Qt.RightButton: self._finish_poly()
+        elif self._mode == "caliper" and ev.button() == QtCore.Qt.LeftButton:
+            x, y = self._disp_to_proc_xy(QtCore.QPointF(ev.pos()))
+            self._line_roi = LineROI(cx=x, cy=y, angle_deg=0.0, length=120.0, thickness=15.0)
+            self.roiChanged.emit(self._line_roi)
+            self.update()
+
+    def mouseMoveEvent(self, ev: QtGui.QMouseEvent):
+        if self._mode == "caliper" and ev.buttons() & QtCore.Qt.LeftButton and self._line_roi:
+            x, y = self._disp_to_proc_xy(QtCore.QPointF(ev.pos()))
+            dx = x - self._line_roi.cx
+            dy = y - self._line_roi.cy
+            self._line_roi.length = max(20.0, 2.0*np.hypot(dx, dy))
+            self._line_roi.angle_deg = math.degrees(math.atan2(dy, dx))
+            self.roiChanged.emit(self._line_roi)
+            self.update()
+        elif self._rect_mode and ev.buttons() & QtCore.Qt.LeftButton:
+            super().mouseMoveEvent(ev)
+            self._rubber.setGeometry(QtCore.QRect(self._origin, ev.pos()).normalized())
+
+    def wheelEvent(self, ev: QtGui.QWheelEvent):
+        if self._mode == "caliper" and self._line_roi:
+            if ev.modifiers() & QtCore.Qt.AltModifier:
+                self._line_roi.thickness = max(5.0, self._line_roi.thickness + (1 if ev.angleDelta().y() > 0 else -1))
+            else:
+                self._line_roi.angle_deg = (self._line_roi.angle_deg + (5 if ev.angleDelta().y() > 0 else -5)) % 180.0
+            self.roiChanged.emit(self._line_roi)
+            self.update()
+        else:
+            super().wheelEvent(ev)
         # NEW: start dragging VP handle if in define mode
         if self._vp_mode and ev.button() == QtCore.Qt.LeftButton and self._vp_roi_proc is not None:
             r = self._vp_roi_disp_rect()

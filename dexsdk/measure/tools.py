@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Tuple, List, Optional, Dict, Any
 import numpy as np
 import cv2
+import math
 
 from .schema import CaliperGuide, AngleBetween, CircleParams, Measurement, Packet, ROI
 from ._subpix import subpix_edge_1d  # already in your repo (kept)
@@ -160,3 +161,129 @@ def tool_circle_diameter(gray_roi: np.ndarray, prm: CircleParams) -> Tuple[Measu
 
     (xc, yc, R), rmse = fit_circle_taubin(good)
     return Measurement(id="diameter", kind="px", value=float(2.0*R), sigma=float(rmse)), {"pts": pts, "ok": mask, "circle": (xc, yc, R)}
+
+
+def _warp_strip(gray: np.ndarray, roi, debug: Dict[str, Any]):
+    """
+    Extract an upright strip of shape (thickness, length) centered at roi.(cx,cy),
+    aligned so that the strip's X axis follows the ROI line direction.
+    Returns (strip, M, Minv) where:
+      - strip: float32 image [thickness x length]
+      - M: 2x3 affine that maps strip coords -> image coords
+      - Minv: inverse for back-projection image -> strip
+    """
+    cx, cy = roi.cx, roi.cy
+    L, T = float(roi.length), float(roi.thickness)
+    a = math.radians(roi.angle_deg)
+
+    # Strip frame basis: x axis = line direction, y axis = normal
+    ux = np.array([ math.cos(a), math.sin(a) ], np.float32)
+    uy = np.array([-math.sin(a), math.cos(a) ], np.float32)
+
+    # Strip corners in image coords (centered around (cx,cy))
+    # We build an affine that maps strip (0..L, 0..T) -> image
+    strip_center = np.array([cx, cy], np.float32)
+    origin_img = strip_center - 0.5*L*ux - 0.5*T*uy
+    x_axis_img = origin_img + ux * L
+    y_axis_img = origin_img + uy * T
+
+    src = np.float32([[0,0],[L,0],[0,T]])
+    dst = np.float32([origin_img, x_axis_img, y_axis_img])
+
+    M = cv2.getAffineTransform(src, dst)
+    Minv = cv2.invertAffineTransform(M)
+
+    strip = cv2.warpAffine(gray, Minv, (int(round(L)), int(round(T))),
+                           flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+    debug["strip_frame"] = {"origin": origin_img, "x_end": x_axis_img, "y_end": y_axis_img}
+    return strip, M, Minv
+
+def _edges_from_strip(strip: np.ndarray, params: Dict[str, Any]):
+    """
+    Scan along the strip normal → build 1D profile by averaging across thickness.
+    Find edge locations (subpixel) along length axis.
+    """
+    # Average over thickness dimension → 1D profile of length L
+    profile = strip.mean(axis=0)  # shape [L]
+    # Optional prefilter
+    ksize = int(params.get("smooth", 3))
+    if ksize >= 3 and (ksize % 2 == 1):
+        profile = cv2.GaussianBlur(profile.reshape(1,-1), (ksize,1), 0).ravel()
+
+    # Polarity: "any"|"rise"|"fall"
+    polarity = params.get("polarity", "any")
+    grad = np.gradient(profile)
+    if polarity == "rise":
+        grad_raw = grad
+    elif polarity == "fall":
+        grad_raw = -grad
+    else:
+        grad_raw = np.abs(grad)
+
+    # Peak picking with min contrast
+    min_contrast = float(params.get("min_contrast", 5.0))
+    # naive non-maximum suppression
+    candidates = []
+    for i in range(1, len(grad_raw)-1):
+        if grad_raw[i] > grad_raw[i-1] and grad_raw[i] > grad_raw[i+1] and abs(grad[i]) >= min_contrast:
+            # refine subpixel around i using parabola fit on grad (not abs)
+            idx_f = subpix_edge_1d(profile) if params.get("use_global_peak") else _parabola_refine(grad, i)
+            strength = float(abs(grad[int(round(idx_f))])) if 0 <= int(round(idx_f)) < len(grad) else float(abs(grad[i]))
+            candidates.append((idx_f, strength))
+
+    # Sort by strength and keep top N
+    max_edges = int(params.get("max_edges", 2))
+    candidates.sort(key=lambda t: t[1], reverse=True)
+    picks = candidates[:max_edges]
+
+    return profile, grad, picks
+
+def _parabola_refine(y: np.ndarray, i: int) -> float:
+    # classic 3-point quadratic vertex refinement
+    if i <= 0 or i >= len(y)-1: 
+        return float(i)
+    y1,y2,y3 = y[i-1], y[i], y[i+1]
+    denom = (y1 - 2*y2 + y3)
+    if denom == 0:
+        return float(i)
+    offset = 0.5*(y1 - y3)/denom
+    return float(i + offset)
+
+def tool_line_caliper(gray: np.ndarray, roi, params: Dict[str, Any]):
+    """
+    Returns:
+      dict with keys:
+       - edges_img: list[(x,y,strength)]   # in image coords
+       - profile: np.ndarray               # 1D profile
+       - grad: np.ndarray
+       - strip_box: ((x0,y0),(x1,y1),(x2,y2)) for drawing
+       - ok: bool
+       - msg: str
+    """
+    debug = {}
+    strip, M, Minv = _warp_strip(gray, roi, debug)
+    profile, grad, picks = _edges_from_strip(strip, params)
+
+    # Back-project edges to image coords
+    edges_img = []
+    for idx_f, strength in picks:
+        pt_strip = np.array([[idx_f, strip.shape[0]*0.5, 1.0]], np.float32).T  # center across thickness
+        x = M[0,0]*pt_strip[0]+M[0,1]*pt_strip[1]+M[0,2]
+        y = M[1,0]*pt_strip[0]+M[1,1]*pt_strip[1]+M[1,2]
+        edges_img.append((float(x), float(y), strength))
+
+    # Basic GO/NO-GO (example: need >= 1 edge)
+    need_edges = int(params.get("need_edges", 1))
+    ok = len(edges_img) >= need_edges
+    msg = f"found {len(edges_img)} edges; need ≥ {need_edges}"
+
+    return {
+        "edges_img": edges_img,
+        "profile": profile,
+        "grad": grad,
+        "strip_box": (debug["strip_frame"]["origin"],
+                      debug["strip_frame"]["x_end"],
+                      debug["strip_frame"]["y_end"]),
+        "ok": ok,
+        "msg": msg
+    }

@@ -351,3 +351,21 @@ class AnchorHelper:
         nx, ny = int(round(mn[0])), int(round(mn[1]))
         nw, nh = int(round(mx[0] - mn[0])), int(round(mx[1] - mn[1]))
         return [nx, ny, max(1, nw), max(1, nh)]
+
+def measure_edge_pair_width(gray, roi, px_to_mm: float, params):
+    res = tool_line_caliper(gray, roi, {**params, "max_edges": 2, "need_edges": 2})
+    if len(res["edges_img"]) < 2:
+        return {"ok": False, "value": None, "msg": res["msg"]}
+    (x1,y1,_),(x2,y2,_) = sorted(res["edges_img"], key=lambda t: t[0])  # along strip x
+    width_px = np.hypot(x2-x1, y2-y1)
+    return {"ok": True, "value": width_px*px_to_mm, "debug": res}
+
+def measure_angle_between_two_lines(line_roi_a, line_roi_b):
+    da = (line_roi_a.angle_deg % 180.0)
+    db = (line_roi_b.angle_deg % 180.0)
+    d = abs(da - db)
+    if d > 90: d = 180 - d
+    return {"ok": True, "value_deg": d}
+
+def go_no_go(value, lo, hi):
+    return (lo <= value <= hi)

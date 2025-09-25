@@ -64,3 +64,11 @@ class Packet:
     units: str  # "px" or "mm"
     measures: List[Measurement]
     overlay: Optional[Any] = None   # cv2 BGR image for server rendering if needed
+
+@dataclass
+class LineROI:
+    cx: float          # center x (px)
+    cy: float          # center y (px)
+    angle_deg: float   # line direction in degrees (0 = +x)
+    length: float      # line length in px
+    thickness: float   # sampling strip thickness in px
