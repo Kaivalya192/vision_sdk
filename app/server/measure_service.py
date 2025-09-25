@@ -12,6 +12,22 @@ from dexsdk.measure.tools import (
 )
 from dexsdk.measure.schema import CaliperGuide, AngleBetween, CircleParams
 
+def _call_tool_optional_params(fn, *args):
+    """
+    Call dexsdk tool functions that may or may not require a trailing
+    'params' argument. Falls back to passing an empty dict.
+    """
+    try:
+        return fn(*args)
+    except TypeError as e:
+        # Newer dexsdk versions: ... missing required positional argument: 'params'
+        if "params" in str(e):
+            try:
+                return fn(*args, {})
+            except TypeError:
+                # try keyword, in case signature enforces name
+                return fn(*args, params={})
+        raise
 
 def _to_gray(frame_bgr: np.ndarray) -> np.ndarray:
     if frame_bgr.ndim == 2:
@@ -153,26 +169,27 @@ class MeasureService:
                 "units": "px"
             }
             return packet, None
-
+        
     # ---- tool runners ----
     def _run_line_caliper(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         g = _parse_caliper(params, gray_roi.shape)
-        return tool_line_caliper(gray_roi, g)
+        return _call_tool_optional_params(tool_line_caliper, gray_roi, g)
 
     def _run_edge_pair_width(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         gA = _parse_caliper(params.get("gA", {}), gray_roi.shape)
         gB = _parse_caliper(params.get("gB", {}), gray_roi.shape)
-        return tool_edge_pair_width(gray_roi, gA, gB)
+        return _call_tool_optional_params(tool_edge_pair_width, gray_roi, gA, gB)
 
     def _run_angle_between(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         g1 = _parse_caliper(params.get("g1", {}), gray_roi.shape)
         g2 = _parse_caliper(params.get("g2", {}), gray_roi.shape)
         ab = AngleBetween(g1=g1, g2=g2)
-        return tool_angle_between(gray_roi, ab)
+        return _call_tool_optional_params(tool_angle_between, gray_roi, ab)
 
     def _run_circle_diameter(self, gray_roi: np.ndarray, params: Dict[str, Any]):
         cp = _parse_circle_params(params, gray_roi.shape)
-        return tool_circle_diameter(gray_roi, cp)
+        return _call_tool_optional_params(tool_circle_diameter, gray_roi, cp)
+
 
     # ---- packet / units helpers ----
     def _packet_from_measure(self, m, default_units: str = "px") -> Dict[str, Any]:
