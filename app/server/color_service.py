@@ -60,9 +60,25 @@ class ColorService:
         out: List[Dict] = []
 
         for idx, cls in enumerate(self.classes, start=1):
-            lower = np.array([int(cls["h_min"]), int(cls["s_min"]), int(cls["v_min"])], dtype=np.uint8)
-            upper = np.array([int(cls["h_max"]), int(cls["s_max"]), int(cls["v_max"])], dtype=np.uint8)
-            mask = cv2.inRange(hsv, lower, upper)
+            hmin = int(cls["h_min"]); hmax = int(cls["h_max"])
+            smin = int(cls["s_min"]); smax = int(cls["s_max"])
+            vmin = int(cls["v_min"]); vmax = int(cls["v_max"])
+
+            if hmin <= hmax:
+                # normal single band
+                lower = np.array([hmin, smin, vmin], dtype=np.uint8)
+                upper = np.array([hmax, smax, vmax], dtype=np.uint8)
+                mask = cv2.inRange(hsv, lower, upper)
+            else:
+                # HUE WRAP (e.g. h_min=174, h_max=15)
+                lower1 = np.array([hmin, smin, vmin], dtype=np.uint8)
+                upper1 = np.array([179,  smax, vmax], dtype=np.uint8)
+                lower2 = np.array([0,    smin, vmin], dtype=np.uint8)
+                upper2 = np.array([hmax, smax, vmax], dtype=np.uint8)
+                m1 = cv2.inRange(hsv, lower1, upper1)
+                m2 = cv2.inRange(hsv, lower2, upper2)
+                mask = cv2.bitwise_or(m1, m2)
+
             mask = self._morph(mask)
 
             cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
