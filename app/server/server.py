@@ -17,14 +17,7 @@ from .led_service import LEDClient, LEDStateMachine
 from .router import CommandRouter
 from .streamer import Streamer
 from .types import ViewConfig, WSMessage
-from .measure_service import MeasureService
-from .robot_calib import RobotMap
-from .calib_io import ensure_dir, save_k_json, load_k_json
-from dexsdk.calib.single_view_intrinsics import estimate_intrinsics
-from dexsdk.calib.plane_scale import compute_plane_scale
-import os
 import base64
-
 
 JPEG_QUAL = 80
 DEFAULT_PROC_WIDTH = 640
@@ -41,16 +34,6 @@ class VisionServer:
         self.detect = DetectService(max_slots=MAX_SLOTS, min_center_dist_px=40)
         self.stream = Streamer(jpeg_quality=JPEG_QUAL, prefer_b64=True)
         self.router = CommandRouter()
-        self._k_path = os.path.expanduser("~/.vision_sdk/K.json")
-        self._robot_path = os.path.expanduser("~/.vision_sdk/robot_map.json")
-        ensure_dir(os.path.dirname(self._k_path))
-        self.measure = MeasureService(self._get_mm_scale)
-        self.robot = RobotMap()
-        # try load previous robot map
-        try:
-            self.robot.load(self._robot_path)
-        except Exception:
-            pass
 
         self.clients: Set[WebSocketServerProtocol] = set()
         self.mode = "training"  # training | trigger
@@ -67,22 +50,15 @@ class VisionServer:
 
         self._register_handlers()
 
-    def _get_mm_scale(self):
-        data = load_k_json(self._k_path) or {}
-        ps = (data.get("plane_scale") or {})
-        try:
-            return {
-                "px_per_mm_x": float(ps.get("px_per_mm_x", 0.0)),
-                "px_per_mm_y": float(ps.get("px_per_mm_y", 0.0)),
-            }
-        except Exception:
-            return {"px_per_mm_x": 0.0, "px_per_mm_y": 0.0}
-
     def _register_handlers(self):
         r = self.router
 
         async def h_ping(ws, msg: WSMessage):
-            await ws.send(json.dumps({"type": "pong", "ts_ms": int(time.time() * 1000), **({"req_id": msg["req_id"]} if "req_id" in msg else {})}))
+            await ws.send(json.dumps({
+                "type": "pong",
+                "ts_ms": int(time.time() * 1000),
+                **({"req_id": msg["req_id"]} if "req_id" in msg else {})
+            }))
 
         async def h_set_mode(ws, msg: WSMessage):
             self.mode = str(msg.get("mode", "training")).lower()
@@ -109,15 +85,19 @@ class VisionServer:
 
         async def h_set_params(ws, msg: WSMessage):
             p = msg.get("params", {})
-            # apply camera parameters (same as monolith)
+            # fps
             try:
                 if "fps" in p:
                     self.camera.cam.set_framerate(float(p["fps"]))
             except Exception:
                 pass
+            # exposure/gain
             if not p.get("auto_exposure", True):
                 try:
-                    self.camera.cam.set_manual_exposure(int(p.get("exposure_us", 6000)), float(p.get("gain", 2.0)))
+                    self.camera.cam.set_manual_exposure(
+                        int(p.get("exposure_us", 6000)),
+                        float(p.get("gain", 2.0)),
+                    )
                 except Exception:
                     pass
             else:
@@ -125,6 +105,7 @@ class VisionServer:
                     self.camera.cam.set_auto_exposure(True)
                 except Exception:
                     pass
+            # awb
             awb_mode = p.get("awb_mode", "auto")
             if awb_mode == "manual" or ("awb_rb" in p and not p.get("auto_exposure", False)):
                 rg, bg = p.get("awb_rb", [2.0, 2.0])
@@ -137,11 +118,13 @@ class VisionServer:
                     self.camera.cam.set_awb_mode(awb_mode)
                 except Exception:
                     pass
+            # focus
             if p.get("focus_mode") == "manual":
                 try:
                     self.camera.cam.set_lens_position(float(p.get("dioptre", 0.0)))
                 except Exception:
                     pass
+            # image adjustments
             try:
                 self.camera.cam.set_image_adjustments(
                     brightness=p.get("brightness"),
@@ -233,6 +216,7 @@ class VisionServer:
                 err = str(e)
             await r.send_acked(ws, msg, ok=ok, error=err, extra={"dioptre": dioptre})
 
+        # Register handlers
         r.register("ping", h_ping)
         r.register("set_mode", h_set_mode)
         r.register("trigger", h_trigger)
@@ -246,154 +230,6 @@ class VisionServer:
         r.register("clear_template", h_clear_template)
         r.register("set_slot_state", h_set_slot_state)
         r.register("af_trigger", h_af_trigger)
-
-        async def h_set_anchor_source(ws, msg: WSMessage):
-            self.measure.anchor.set_source(str(msg.get("object", "")).strip())
-            self.measure.anchor.reset_ref()
-            await r.send_acked(ws, msg)
-
-        async def h_set_anchor_enabled(ws, msg: WSMessage):
-            en = bool(msg.get("enabled", False))
-            try:
-                self.measure.anchor.set_enabled(en)
-            except Exception:
-                pass
-            await r.send_acked(ws, msg)
-
-        async def h_anchor_reset_ref(ws, msg: WSMessage):
-            ok = True
-            try:
-                self.measure.anchor.reset_ref()
-            except Exception:
-                ok = False
-            await r.send_acked(ws, msg, ok=ok)
-
-        r.register("set_anchor_source", h_set_anchor_source)
-        r.register("set_anchor_enabled", h_set_anchor_enabled)
-        r.register("anchor_reset_ref", h_anchor_reset_ref)
-        
-        async def h_run_measure(ws, msg: WSMessage):
-            """
-            msg: {
-            "job": {"tool": "...", "params": {...}, "roi": [x,y,w,h]},
-            "anchor": true|false
-            }
-            """
-            job = msg.get("job", {}) or {}
-            use_anchor = bool(msg.get("anchor", False))
-
-            frame = self.last_proc_bgr.copy() if self.last_proc_bgr is not None else None
-            if frame is None:
-                await r.send_acked(ws, msg, ok=False, error="no frame")
-                return
-
-            loop = asyncio.get_running_loop()
-
-            def _work():
-                # Preferred signature: (frame, job, anchor=...)
-                return self.measure.run_job(frame, job, anchor=use_anchor)
-
-            try:
-                packet, ov = await loop.run_in_executor(None, _work)
-            except TypeError:
-                # Back-compat: older MeasureService without 'anchor'
-                def _work_old():
-                    return self.measure.run_job(frame, job)
-                packet, ov = await loop.run_in_executor(None, _work_old)
-
-            ov_img = ov if ov is not None else frame
-            jpeg = await loop.run_in_executor(
-                None,
-                lambda: cv2.imencode(".jpg", ov_img, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes()
-            )
-            b64 = base64.b64encode(jpeg).decode("ascii")
-
-            await self.stream.broadcast_json(
-                self.clients,
-                {"type": "measures", "packet": packet, "overlay_jpeg_b64": b64}
-            )
-            await r.send_acked(ws, msg)
-
-        r.register("run_measure", h_run_measure)
-             # ---- One-click calibration ---------------------------------------
-        async def h_calibrate(ws, msg: WSMessage):
-            await r.send_acked(ws, msg)
-
-            frame = self.last_proc_bgr.copy() if self.last_proc_bgr is not None else None
-            if frame is None:
-                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": False, "error": "no frame"})
-                return
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            loop = asyncio.get_running_loop()
-
-            def _work():
-                # 1) Intrinsics
-                intr = estimate_intrinsics(gray)
-
-                # Write K/dist immediately so plane_scale can undistort
-                k_only = {
-                    "model": intr.get("model"),
-                    "K": intr.get("K"),
-                    "dist": intr.get("dist"),
-                    "image_size": intr.get("image_size"),
-                    "created_at_ms": int(time.time() * 1000),
-                }
-                save_k_json(self._k_path, k_only)
-
-                # 2) Plane scale with undistortion
-                plane = compute_plane_scale(
-                    gray,
-                    K_json=self._k_path,
-                    cfg={"target_width": 0, "pair_weight": 0.5, "no_bias": False}
-                )
-
-                payload = {
-                    **k_only,
-                    "rms_reprojection_error_px": intr.get("rms_reprojection_error_px"),
-                    "rmse_px": intr.get("rmse_px"),
-                    "plane_scale": plane.get("summary", {}).get("plane_scale", {}),
-                }
-
-                # 3) Overlay: tag outlines + text
-                ov = frame.copy()
-                for d in plane.get("detections", []):
-                    try:
-                        arr = np.array(d.get("corners_px", []), dtype=np.float32).reshape(-1, 2)
-                        if arr.shape[0] >= 4:
-                            cv2.polylines(ov, [arr.astype(np.int32)], True, (0, 255, 0), 2)
-                    except Exception:
-                        pass
-
-                ps = payload.get("plane_scale") or {}
-                try:
-                    txt = (f"px/mm X={ps['px_per_mm_x']:.3f} Y={ps['px_per_mm_y']:.3f}\n"
-                        f"mm/px X={ps['mm_per_px_x']:.5f} Y={ps['mm_per_px_y']:.5f}")
-                except Exception:
-                    txt = "no plane scale"
-                y0 = 24
-                for i, line in enumerate(txt.split("\n")):
-                    cv2.putText(ov, line, (12, y0 + 24*i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 3, cv2.LINE_AA)
-                    cv2.putText(ov, line, (12, y0 + 24*i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
-
-                # Save final combined JSON (K + plane_scale)
-                save_k_json(self._k_path, payload)
-                return payload, ov
-
-
-            try:
-                payload, ov = await loop.run_in_executor(None, _work)
-                jpeg = await loop.run_in_executor(None, lambda:
-                    cv2.imencode(".jpg", ov, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes())
-                b64 = base64.b64encode(jpeg).decode("ascii")
-                await self.stream.broadcast_json(
-                    self.clients,
-                    {"type": "calibration", "ok": True, "saved": self._k_path, "summary": payload, "overlay_jpeg_b64": b64}
-                )
-            except Exception as e:
-                await self.stream.broadcast_json(self.clients, {"type": "calibration", "ok": False, "error": str(e)})
-
-        r.register("calibrate_one_click", h_calibrate)
 
     async def start(self):
         async with websockets.serve(
@@ -423,15 +259,15 @@ class VisionServer:
         while True:
             t0 = time.perf_counter()
 
-            # LED state update; may request capture in trigger mode
+            # LED state; may request capture in trigger mode
             capture_event = self.led.update("training" if self.mode == "training" else "trigger")
 
-            # capture RGB
+            # capture RGB -> BGR (proc)
             rgb = self.camera.get_frame(self.view)
             bgr_small = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             self.last_proc_bgr = bgr_small
 
-            # detection decision
+            # detection cadence
             detect_now = False
             if self.mode == "training":
                 detect_now = (self.every_counter % self.publish_every) == 0
@@ -443,13 +279,8 @@ class VisionServer:
             objs: List[Dict] = []
             if detect_now:
                 overlay_bgr, objs, _ = self.detect.compute_all(bgr_small, draw=True)
-                # Feed detections to the measurement fixture helper
-                try:
-                    self.measure.anchor.update_detections(objs)
-                except Exception:
-                    pass
 
-            # broadcast
+            # broadcast current frame (overlay if available / recent)
             if self.clients:
                 send_bgr = (
                     overlay_bgr
@@ -464,15 +295,33 @@ class VisionServer:
                     self.last_overlay_bgr = overlay_bgr
                     self.overlay_until = time.time() + 1.0
 
-                await self.stream.broadcast_frame(self.clients, send_bgr, send_bgr.shape[1], send_bgr.shape[0], loop=loop)
+                await self.stream.broadcast_frame(
+                    self.clients, send_bgr, send_bgr.shape[1], send_bgr.shape[0], loop=loop
+                )
+
                 if detect_now:
+                    # also include a base64 overlay for UIs that want to swap immediately
+                    overlay_b64 = None
+                    if overlay_bgr is not None:
+                        try:
+                            jpeg = cv2.imencode(".jpg", overlay_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes()
+                            overlay_b64 = base64.b64encode(jpeg).decode("ascii")
+                        except Exception:
+                            overlay_b64 = None
+
                     await self.stream.broadcast_json(
-                        self.clients, {"type": "detections", "payload": {"result": {"objects": objs}}, "overlay_jpeg_b64": None}
+                        self.clients,
+                        {
+                            "type": "detections",
+                            "payload": {"result": {"objects": objs}},
+                            "overlay_jpeg_b64": overlay_b64,
+                        },
                     )
 
             self.every_counter += 1
             self.frame_id += 1
 
+            # ~30 fps pacing
             await asyncio.sleep(max(0, (1 / 30.0) - (time.perf_counter() - t0)))
 
 
