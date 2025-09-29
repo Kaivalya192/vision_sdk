@@ -721,10 +721,11 @@ class MainWindow(QtWidgets.QMainWindow):
         h = int(np.median(hsv[..., 0]))
         s = int(np.median(hsv[..., 1]))
         v = int(np.median(hsv[..., 2]))
+        
+        dh = 12   # hue half-width (kept similar)
+        ds = 70   # saturation half-width  (was 40)
+        dv = 70   # value half-width       (was 40)
 
-        dh = 10
-        ds = 40
-        dv = 40
 
         # hue window, WRAP-AWARE
         if h - dh < 0:
@@ -878,7 +879,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         b64 = msg.get("overlay_jpeg_b64")
         if b64:
-            qi = self._decode_b64_to_qimage(b64)
+            qi, _ = self._decode_b64_to_qimage_and_bgr(b64)  # ← was _decode_b64_to_qimage(...)
             if qi:
                 self._last_overlay = qi
                 self._overlay_until = time.time() + 1.0
