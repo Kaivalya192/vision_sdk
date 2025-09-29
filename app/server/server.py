@@ -18,6 +18,8 @@ from .router import CommandRouter
 from .streamer import Streamer
 from .types import ViewConfig, WSMessage
 import base64
+from .color_service import ColorService
+import base64
 
 JPEG_QUAL = 80
 DEFAULT_PROC_WIDTH = 640
@@ -45,6 +47,8 @@ class VisionServer:
         self.last_overlay_bgr: Optional[np.ndarray] = None
         self.overlay_until = 0.0
         self.last_proc_bgr: Optional[np.ndarray] = None
+        self.color = ColorService()
+        self.color_stream_enabled = False
 
         self.led = LEDStateMachine(LEDClient(LED_HOST, LED_PORT), pre_ms=PRE_MS, post_ms=POST_MS)
 
@@ -215,6 +219,48 @@ class VisionServer:
                 ok = False
                 err = str(e)
             await r.send_acked(ws, msg, ok=ok, error=err, extra={"dioptre": dioptre})
+        
+        async def h_color_set_rules(ws, msg):
+            applied = self.color.set_rules(
+                msg.get("classes", []),
+                kernel_size       = msg.get("kernel_size"),
+                min_area_global   = msg.get("min_area_global"),
+                open_iter         = msg.get("open_iter"),
+                close_iter        = msg.get("close_iter"),
+            )
+            await r.send_acked(ws, msg, extra={"applied": applied})
+
+        async def h_color_run_once(ws, msg):
+            if self.last_proc_bgr is None:
+                await r.send_acked(ws, msg, ok=False, error="no frame")
+                return
+            vis, dets, _ = self.color.run(self.last_proc_bgr)
+            # overlay to b64 for UI
+            overlay_b64 = None
+            try:
+                jpeg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes()
+                overlay_b64 = base64.b64encode(jpeg).decode("ascii")
+            except Exception:
+                pass
+            await self.stream.broadcast_json(self.clients, {
+                "type": "color_results",
+                "objects": dets,
+                "overlay_jpeg_b64": overlay_b64
+            })
+            await r.send_acked(ws, msg)
+
+        async def h_color_set_stream(ws, msg):
+            self.color_stream_enabled = bool(msg.get("enabled", False))
+            await r.send_acked(ws, msg, extra={"enabled": self.color_stream_enabled})
+
+        async def h_color_clear_rules(ws, msg):
+            self.color.set_rules([])
+            await r.send_acked(ws, msg)
+
+        r.register("color_set_rules",  h_color_set_rules)
+        r.register("color_run_once",   h_color_run_once)
+        r.register("color_set_stream", h_color_set_stream)
+        r.register("color_clear_rules",h_color_clear_rules)
 
         # Register handlers
         r.register("ping", h_ping)
@@ -317,6 +363,22 @@ class VisionServer:
                             "overlay_jpeg_b64": overlay_b64,
                         },
                     )
+                # stream color overlay at camera FPS (lightweight)
+                if self.clients and self.color_stream_enabled and self.last_proc_bgr is not None:
+                    try:
+                        vis, dets, _ = self.color.run(self.last_proc_bgr)
+                        overlay_b64 = None
+                        try:
+                            jpeg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUAL])[1].tobytes()
+                            overlay_b64 = base64.b64encode(jpeg).decode("ascii")
+                        except Exception:
+                            pass
+                        await self.stream.broadcast_json(
+                            self.clients, {"type": "color_results", "objects": dets, "overlay_jpeg_b64": overlay_b64}
+                        )
+                    except Exception:
+                        # keep loop healthy
+                        pass
 
             self.every_counter += 1
             self.frame_id += 1
