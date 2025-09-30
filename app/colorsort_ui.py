@@ -86,6 +86,7 @@ class VideoLabel(QtWidgets.QLabel):
 
     def enable_pick(self, ok: bool):
         self._pick_mode = ok
+        print(f"[DEBUG] Pick mode set to {ok}", flush=True)
         if ok:
             # disable ROI modes when picking
             self._rect_mode = False
@@ -96,9 +97,11 @@ class VideoLabel(QtWidgets.QLabel):
 
     def mousePressEvent(self, ev: QtGui.QMouseEvent):
         if self._pick_mode and ev.button() == QtCore.Qt.LeftButton:
-            if self._last_draw_rect.contains(ev.pos()):
+            if self._last_draw_rect.isNull() or not self._last_draw_rect.contains(ev.pos()):
+                print("[DEBUG] Click outside video area", flush=True)
+            else:
                 self.pixelClicked.emit(ev.x(), ev.y())
-            return
+                print(f"[DEBUG] Pixel clicked at {ev.x()},{ev.y()}", flush=True)
 
         if self._rect_mode and ev.button() == QtCore.Qt.LeftButton:
             self._origin = ev.pos()
@@ -532,6 +535,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.controlsPanelAction.setChecked(self.controlsPanel.isVisible())
         view_menu.addAction(self.controlsPanelAction)
         view_menu.addAction(self.cameraDock.toggleViewAction())
+        self.controlsPanel.setVisible(True)
+        self.controlsPanelAction.setChecked(True)
 
         # status
         self.status = QtWidgets.QStatusBar(); self.setStatusBar(self.status)
@@ -640,17 +645,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.session_id = msg.get("session_id", "-")
             self.lbl_sess.setText(f"Session {self.session_id}")
         elif t == "frame":
-            # choose image (overlay vs latest frame)
-            qi = None
-            bgr_for_store = None
-            if self._last_overlay is not None and time.time() < self._overlay_until:
-                qi = self._last_overlay  # keep showing overlay briefly
-            else:
-                b64 = msg.get("jpeg_b64", "")
-                if b64:
-                    qi, bgr_for_store = self._decode_b64_to_qimage_and_bgr(b64)
-                    # store BGR only when we use the raw frame (not overlay)
-                    self._last_frame_bgr = bgr_for_store
+            b64 = msg.get("jpeg_b64", "")
+            if b64:
+                qi_raw, bgr_for_store = self._decode_b64_to_qimage_and_bgr(b64)
+                if bgr_for_store is not None:
+                    self._last_frame_bgr = bgr_for_store   # always update!
+                qi = qi_raw
 
             w = msg.get("w"); h = msg.get("h")
             if qi is None or w is None or h is None:
@@ -684,27 +684,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pick_enabled = bool(on)
         self.video.enable_pick(self._pick_enabled)
         self.btn_pick.setText("Pick HSV (active)" if on else "Pick HSV")
-
+        
     def _on_pixel_clicked(self, x_disp: int, y_disp: int):
+        print(f"[DEBUG] _on_pixel_clicked called with ({x_disp},{y_disp})", flush=True)
         draw = self.video._last_draw_rect
         if draw.isNull() or self.last_frame_wh == (0, 0):
+            print("[DEBUG] No valid frame size yet", flush=True)
             self.btn_pick.setChecked(False)
             return
-        
-        if self._last_overlay is not None and time.time() < self._overlay_until:
-            QtWidgets.QToolTip.showText(
-                self.video.mapToGlobal(QtCore.QPoint(x_disp, y_disp)),
-                "Overlay on screen — wait a moment, then pick",
-                self.video
-            )
-        self.btn_pick.setChecked(False)
-        return
+
         if self._last_frame_bgr is None:
-            QtWidgets.QToolTip.showText(
-                self.video.mapToGlobal(QtCore.QPoint(x_disp, y_disp)),
-                "No frame buffer yet — wait for video and try again",
-                self.video
-            )
+            print("[DEBUG] _last_frame_bgr is None!", flush=True)
             self.btn_pick.setChecked(False)
             return
 
@@ -715,13 +705,12 @@ class MainWindow(QtWidgets.QMainWindow):
         y_img = int((y_disp - draw.y()) * sy)
         x_img = max(0, min(fw - 1, x_img))
         y_img = max(0, min(fh - 1, y_img))
+        print(f"[DEBUG] mapped to image coords=({x_img},{y_img})", flush=True)
 
-        # Use a small neighborhood for robustness
-        r = 4  # half window size (results in (2r+1)x(2r+1))
-        x0, x1 = max(0, x_img - r), min(fw - 1, x_img + r)
-        y0, y1 = max(0, y_img - r), min(fh - 1, y_img + r)
-        roi = self._last_frame_bgr[y0:y1+1, x0:x1+1]
-        if roi.size == 0:
+        roi = self._last_frame_bgr[max(0, y_img-4):y_img+5, max(0, x_img-4):x_img+5]
+        print(f"[DEBUG] ROI shape={None if roi is None else roi.shape}", flush=True)
+        if roi is None or roi.size == 0:
+            print("[DEBUG] ROI empty, aborting", flush=True)
             self.btn_pick.setChecked(False)
             return
 
@@ -729,46 +718,48 @@ class MainWindow(QtWidgets.QMainWindow):
         h = int(np.median(hsv[..., 0]))
         s = int(np.median(hsv[..., 1]))
         v = int(np.median(hsv[..., 2]))
-        
-        dh = 12   # hue half-width (kept similar)
-        ds = 70   # saturation half-width  (was 40)
-        dv = 70   # value half-width       (was 40)
+        print(f"[DEBUG] Median HSV=({h},{s},{v})", flush=True)
 
-
-        # hue window, WRAP-AWARE
-        if h - dh < 0:
-            # wrap below 0  → e.g. [174..179] U [0..15]
-            h_min = 180 + (h - dh)   # becomes 174 if h=5, dh=10
-            h_max = min(179, h + dh)
-        elif h + dh > 179:
-            # wrap above 179 → e.g. [169..179] U [0..4]
-            h_min = max(0, h - dh)
-            h_max = (h + dh) - 180   # becomes 4 if h=175, dh=10
-        else:
-            # no wrap
-            h_min = max(0, h - dh)
-            h_max = min(179, h + dh)
-
+        dh, ds, dv = 12, 70, 70
+        h_min = max(0, h - dh); h_max = min(179, h + dh)
         s_min = max(0, s - ds); s_max = min(255, s + ds)
         v_min = max(0, v - dv); v_max = min(255, v + dv)
 
-        # Update sliders (these can show h_min > h_max when wrapping — that's OK, server handles it)
-        self._sl["h_min"][1].setValue(int(h_min))
-        self._sl["h_max"][1].setValue(int(h_max))
-        self._sl["s_min"][1].setValue(int(s_min)); self._sl["s_max"][1].setValue(int(s_max))
-        self._sl["v_min"][1].setValue(int(v_min)); self._sl["v_max"][1].setValue(int(v_max))
+        # Update sliders visibly
+        for k, val in [("h_min", h_min), ("h_max", h_max),
+                    ("s_min", s_min), ("s_max", s_max),
+                    ("v_min", v_min), ("v_max", v_max)]:
+            sld, spn = self._sl[k]
+            sld.blockSignals(True); spn.blockSignals(True)
+            sld.setValue(val); spn.setValue(val)
+            sld.blockSignals(False); spn.blockSignals(False)
 
-
-        QtWidgets.QToolTip.showText(
-            self.video.mapToGlobal(QtCore.QPoint(x_disp, y_disp)),
-            f"HSV≈({h},{s},{v}) → "
-            f"H[{h_min},{h_max}] S[{s_min},{s_max}] V[{v_min},{v_max}]",
-            self.video
+        # --- auto-create/update a "picked" class ---
+        picked_class = dict(
+            name="picked",
+            h_min=h_min, h_max=h_max,
+            s_min=s_min, s_max=s_max,
+            v_min=v_min, v_max=v_max,
+            min_area=int(self.sp_min_area.value()),
+            max_area=1_000_000,
+            aspect_min=0.0, aspect_max=10.0,
+            circularity_min=0.0
         )
+        if self._classes and self._classes[-1].get("name") == "picked":
+            self._classes[-1] = picked_class
+        else:
+            self._classes.append(picked_class)
+        self._refresh_class_list()
 
-        # Turn pick mode off after one pick
+        # --- auto-send rules to server ---
+        self._send_rules()
+
+        print(f"[PICK] HSV≈({h},{s},{v}) → "
+            f"H[{h_min},{h_max}] S[{s_min},{s_max}] V[{v_min},{v_max}]",
+            flush=True)
+
+        # disable pick mode after click
         self.btn_pick.setChecked(False)
-
 
     def _add_class_from_sliders(self):
         name, ok = QtWidgets.QInputDialog.getText(self, "Class name", "Enter class name:")
