@@ -7,11 +7,27 @@ import sys, time, base64, json
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import cv2
-
+import socket 
 from PyQt5 import QtCore, QtGui, QtWidgets, QtWebSockets
 
 
 # ------------------------ Video Label (rect/poly capture only) ------------------------
+class RobotUDPPublisher:
+    def __init__(self, host: str = "127.0.0.1", port: int = 40001):
+        self._host = host
+        self._port = int(port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def set_target(self, host: str, port: int):
+        self._host = host.strip()
+        self._port = int(port)
+
+    def send_json(self, payload: dict):
+        try:
+            msg = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self._sock.sendto(msg, (self._host, self._port))
+        except Exception as e:
+            print(f"[PUB] UDP send error: {e}", flush=True)
 
 class VideoLabel(QtWidgets.QLabel):
     roiSelected     = QtCore.pyqtSignal(QtCore.QRect)  # rectangle selection (display coords)
@@ -363,15 +379,28 @@ class MainWindow(QtWidgets.QMainWindow):
         left_panel = QtWidgets.QWidget()
         left_v = QtWidgets.QVBoxLayout(left_panel)
         left_v.setSpacing(10)
-
+        
         # Connection
         conn_box = QtWidgets.QGroupBox("Connection")
         ch = QtWidgets.QHBoxLayout(conn_box)
         self.ed_host = QtWidgets.QLineEdit("ws://192.168.1.2:8765")
         self.btn_conn = QtWidgets.QPushButton("Connect")
         self.btn_disc = QtWidgets.QPushButton("Disconnect"); self.btn_disc.setEnabled(False)
-        for w in (self.ed_host, self.btn_conn, self.btn_disc): ch.addWidget(w)
+
+        # --- ADD: robot UDP target + auto-publish toggle ---
+        self.ed_robot_ip = QtWidgets.QLineEdit("192.168.1.50")
+        self.sp_robot_port = QtWidgets.QSpinBox(); self.sp_robot_port.setRange(1, 65535); self.sp_robot_port.setValue(40001)
+        self.chk_pub_robot = QtWidgets.QCheckBox("Auto publish to robot"); self.chk_pub_robot.setChecked(True)
+
+        for w in (self.ed_host, self.btn_conn, self.btn_disc,
+                QtWidgets.QLabel(" Robot:"), self.ed_robot_ip, self.sp_robot_port, self.chk_pub_robot):
+            ch.addWidget(w)
         left_v.addWidget(conn_box)
+
+        # --- ADD: UDP publisher instance + live target binding ---
+        self.pub_robot = RobotUDPPublisher(self.ed_robot_ip.text(), int(self.sp_robot_port.value()))
+        self.ed_robot_ip.textChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
+        self.sp_robot_port.valueChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
 
         # Mode
         mode_box = QtWidgets.QGroupBox("Mode")
@@ -518,6 +547,41 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ping = QtCore.QTimer(interval=10000, timeout=lambda: self._send({"type": "ping"}))
         self._load_settings()
+        
+    def _base_payload(self) -> dict:
+        pw, ph = (int(self.last_frame_wh[0]), int(self.last_frame_wh[1])) if self.last_frame_wh != (0, 0) else (0, 0)
+        return {
+            "version": "1.0",
+            "sdk": "vision_ui",
+            "session": self.session_id,
+            "timestamp_ms": int(time.time() * 1000),
+            "camera": {"proc_width": pw, "proc_height": ph},
+            "result": {"counts": {"objects": 0, "detections": 0}, "objects": []}
+        }
+
+    def _publish_pattern_result_to_robot(self, server_payload: Optional[dict]):
+        """
+        server_payload is typically msg['payload'] from the server.
+        If it's missing the envelope or camera info, we add it.
+        """
+        base = self._base_payload()
+        p = server_payload or {}
+
+        # merge envelope fields if present in server payload
+        for k in ("version", "sdk", "session", "timestamp_ms", "camera", "result"):
+            if k in p:
+                base[k] = p[k]
+
+        # ensure 'result' exists and has counts
+        res = base.setdefault("result", {})
+        objs = res.get("objects") or []
+        res["objects"] = objs
+        dets = sum(len(o.get("detections", []) or []) for o in objs)
+        res["counts"] = {"objects": len(objs), "detections": dets}
+
+        if self.chk_pub_robot.isChecked() and dets > 0:
+            self.pub_robot.send_json(base)
+            self._append_log(f"UDP → robot: objects={len(objs)} dets={dets}")
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "controlsPanel", None) and event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.Show):
@@ -650,6 +714,11 @@ class MainWindow(QtWidgets.QMainWindow):
             qi = self._decode(msg["overlay_jpeg_b64"])
             if qi:
                 self.video.setPixmapKeepAspect(QtGui.QPixmap.fromImage(qi))
+        # --- ADD: publish to robot ---
+        try:
+            self._publish_pattern_result_to_robot(msg.get("payload"))
+        except Exception as e:
+            self._append_log(f"[PUB] pattern publish error: {e}")
 
     # ---- ROI capture mapping ----
     def _disp_to_proc(self, qp: QtCore.QPointF) -> Tuple[float, float]:
@@ -800,6 +869,13 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled = to_bool(settings.value('templates/enabled'))
             if enabled is not None:
                 self.chk_en.setChecked(enabled)
+            robot_ip = to_str(settings.value('robot/ip'))
+            if robot_ip: self.ed_robot_ip.setText(robot_ip)
+            robot_port = to_int(settings.value('robot/port'))
+            if robot_port: self.sp_robot_port.setValue(robot_port)
+            auto_pub = to_bool(settings.value('robot/auto_publish'))
+            if auto_pub is not None: self.chk_pub_robot.setChecked(auto_pub)
+
         finally:
             for w, prev in blocked:
                 w.blockSignals(prev)
@@ -897,6 +973,9 @@ class MainWindow(QtWidgets.QMainWindow):
         settings.setValue('detection/min_center_dist_px', int(self.sp_det_center.value()))
         settings.setValue('camera/state', json.dumps(self.cam_panel.get_state()))
         settings.setValue('logs/history', json.dumps(self._log_buffer[-50:]))
+        settings.setValue('robot/ip', self.ed_robot_ip.text())
+        settings.setValue('robot/port', int(self.sp_robot_port.value()))
+        settings.setValue('robot/auto_publish', bool(self.chk_pub_robot.isChecked()))
         settings.sync()
 
     # ---- send ----
