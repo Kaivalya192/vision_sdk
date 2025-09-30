@@ -152,23 +152,34 @@ class ColorService:
             if self.open_iter  > 0: mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=self.open_iter)
             if self.close_iter > 0: mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=self.close_iter)
             nz_morph = int(cv2.countNonZero(mask))
-
+            
             cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             n_cnt = len(cnts)
             kept_this = 0
 
+            # NEW: reject counters
+            rej_area = rej_maxarea = rej_aspect = rej_circ = 0
+
             for c in cnts:
                 area = int(cv2.contourArea(c))
-                if area < max(self.min_area_global, int(cls.get("min_area", 0))):  continue
-                if area > int(cls.get("max_area", 10**9)):                        continue
+                if area < max(self.min_area_global, int(cls.get("min_area", 0))):
+                    rej_area += 1
+                    continue
+                if area > int(cls.get("max_area", 10**9)):
+                    rej_maxarea += 1
+                    continue
                 x,y,w,h = cv2.boundingRect(c)
                 aspect = (w/float(h)) if h>0 else 0.0
                 if not (float(cls.get("aspect_min",0.0)) <= aspect <= float(cls.get("aspect_max",100.0))):
+                    rej_aspect += 1
                     continue
                 circ = _circ(c)
-                if circ < float(cls.get("circularity_min", 0.0)):                  continue
+                if circ < float(cls.get("circularity_min", 0.0)):
+                    rej_circ += 1
+                    continue
 
-                color = ( (37*idx)%256, (97*idx)%256, (173*idx)%256 )  # BGR
+                # draw + record
+                color = ( (37*idx)%256, (97*idx)%256, (173*idx)%256 )
                 cv2.drawContours(vis, [c], -1, color, 2)
                 cv2.rectangle(vis, (x,y), (x+w,y+h), color, 1)
                 cv2.putText(vis, f"{name} {area}", (x, max(0,y-6)),
@@ -183,14 +194,15 @@ class ColorService:
                     "area": area, "centroid": [cx,cy], "circularity": float(circ)
                 })
                 kept_this += 1
-                total_kept += 1
 
-            # Per-class summary (every frame; keep it light)
+            # Log per-class with rejects
             self._log(
                 f"frame#{self._frame_idx} class='{name}' "
                 f"nz_raw={nz_raw} nz_morph={nz_morph} cnt={n_cnt} kept={kept_this} "
+                f"rej(area={rej_area},max={rej_maxarea},asp={rej_aspect},circ={rej_circ}) "
                 f"min_area_g={self.min_area_global} min_area_c={int(cls.get('min_area',0))}"
             )
+
 
         if (self._frame_idx % 15) == 1 or total_kept:
             self._log(f"frame#{self._frame_idx} total objects kept={total_kept}")
