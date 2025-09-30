@@ -690,7 +690,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if draw.isNull() or self.last_frame_wh == (0, 0):
             self.btn_pick.setChecked(False)
             return
-
+        
+        if self._last_overlay is not None and time.time() < self._overlay_until:
+            QtWidgets.QToolTip.showText(
+                self.video.mapToGlobal(QtCore.QPoint(x_disp, y_disp)),
+                "Overlay on screen — wait a moment, then pick",
+                self.video
+            )
+        self.btn_pick.setChecked(False)
+        return
         if self._last_frame_bgr is None:
             QtWidgets.QToolTip.showText(
                 self.video.mapToGlobal(QtCore.QPoint(x_disp, y_disp)),

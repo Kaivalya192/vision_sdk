@@ -83,10 +83,6 @@ class ColorService:
         H, W = frame_bgr.shape[:2]
         vis = frame_bgr.copy()
 
-        # Build HSV in both orders — helps catch RGB-vs-BGR issues
-        hsv_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        hsv_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2HSV)
-
         def _hits_total(hsv_img) -> int:
             total = 0
             for cls in self.classes:
@@ -107,15 +103,10 @@ class ColorService:
                     mask = cv2.bitwise_or(m1, m2)
                 total += int(cv2.countNonZero(mask))
             return total
-
-        hits_bgr = _hits_total(hsv_bgr)
-        hits_rgb = _hits_total(hsv_rgb)
-        hsv = hsv_rgb if hits_rgb > hits_bgr else hsv_bgr
-        chosen = "RGB->HSV" if hsv is hsv_rgb else "BGR->HSV"
-
+        
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         if (self._frame_idx % 15) == 1:
-            self._log(f"run: frame#{self._frame_idx} size={W}x{H} "
-                    f"hits(BGR)={hits_bgr} hits(RGB)={hits_rgb} using={chosen}")
+            self._log(f"run: frame#{self._frame_idx} size={W}x{H} using=BGR->HSV")
 
         # Morph kernel prepared once
         k = max(1, int(self.kernel_size))
@@ -196,6 +187,7 @@ class ColorService:
                 kept_this += 1
 
             # Log per-class with rejects
+            total_kept += kept_this
             self._log(
                 f"frame#{self._frame_idx} class='{name}' "
                 f"nz_raw={nz_raw} nz_morph={nz_morph} cnt={n_cnt} kept={kept_this} "
