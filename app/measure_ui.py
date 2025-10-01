@@ -34,8 +34,8 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"  # fallback: try "eglfs" if no desktop/X11
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # Camera
-from picamera2 import Picamera2
-from libcamera import controls
+from picamera2 import Picamera2 # type: ignore
+from libcamera import controls # type: ignore
 
 # ----- AprilGrid detector -----
 try:
@@ -43,6 +43,31 @@ try:
     HAVE_APRILGRID = True
 except Exception:
     HAVE_APRILGRID = False
+# ==== ADD: ArUco + simple JSON settings ====
+try:
+    import cv2.aruco as aruco
+except Exception:
+    aruco = None  # we'll guard its use
+
+SETTINGS_PATH = os.path.abspath("ui_settings.json")
+
+def _settings_load():
+    try:
+        import json, os
+        if os.path.isfile(SETTINGS_PATH):
+            with open(SETTINGS_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _settings_save(d):
+    try:
+        import json
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
 
 
 # ======================== Shared camera thread ========================
@@ -242,6 +267,128 @@ def compute_pxmm_from_aprilgrid(gray: np.ndarray, rows: int, cols: int,
         "mm_per_px_y": float(1.0/px_per_mm_y) if px_per_mm_y>1e-12 else float("nan"),
     }
 
+# ======================== ArUco helpers (NEW) ========================
+
+def detect_aruco(gray: np.ndarray, dict_name: str = "DICT_4X4_50"):
+    """
+    Detect ArUco markers in a grayscale image. Returns (ids, corners), both from cv2.aruco.
+    dict_name can be one of the standard names: DICT_4X4_50, DICT_5X5_100, etc.
+    """
+    if aruco is None:
+        return None, None
+    dic = getattr(aruco, dict_name, None)
+    if dic is None:
+        # fallback
+        dic = aruco.DICT_4X4_50
+    ar_dict = aruco.getPredefinedDictionary(dic)
+    ar_params = aruco.DetectorParameters()
+    det = aruco.ArucoDetector(ar_dict, ar_params)
+    corners, ids, _ = det.detectMarkers(gray)
+    if ids is None or len(ids) == 0:
+        return None, None
+    return ids.flatten().astype(int), corners  # corners: list of (1,4,2) arrays
+
+def _aruco_edge_sizes_px(c4x2: np.ndarray)->Tuple[float,float]:
+    """Average width (x-direction) and height (y-direction) in pixels from marker corners."""
+    p = c4x2.reshape(-1,2).astype(np.float32)
+    tl,tr,br,bl = p[0],p[1],p[2],p[3]
+    w = 0.5*(np.linalg.norm(tr-tl)+np.linalg.norm(br-bl))
+    h = 0.5*(np.linalg.norm(bl-tl)+np.linalg.norm(br-tr))
+    return float(w), float(h)
+
+def _robust_median(vals):
+    a = np.asarray(vals, dtype=float)
+    if a.size == 0: return float("nan")
+    med = float(np.median(a))
+    if a.size < 5: return med
+    mad = float(np.median(np.abs(a-med)))
+    if mad == 0: return med
+    keep = a[np.abs(a - med) <= 3.0*1.4826*mad]
+    return float(np.median(keep)) if keep.size else med
+
+def compute_pxmm_from_aruco(
+    gray: np.ndarray,
+    rows: int, cols: int,
+    tag_mm: float, gap_mm: float,
+    dict_name: str = "DICT_4X4_50",
+    row_major: bool = True
+) -> Optional[Dict[str, float]]:
+    """
+    Compute px/mm purely from ArUco grid geometry (NO intrinsics).
+    Assumptions:
+      - GridBoard with ids 0..(rows*cols-1)
+      - IDs increase row-wise (row-major) if row_major=True, else column-major.
+      - tag_mm: physical marker side length (mm)
+      - gap_mm: spacing between markers (mm)
+    Method:
+      - px/mm from marker edge lengths (per-marker)
+      - px/mm from neighbor center pitch (X,Y)
+      - take robust medians and average the two estimates
+    """
+    ids, corners_list = detect_aruco(gray, dict_name)
+    if ids is None: 
+        return None
+
+    # Build quick maps
+    id_to_corners = {int(i): corners_list[k].reshape(4,2) for k,i in enumerate(ids)}
+    id_set = set(int(i) for i in ids)
+
+    PITCH = tag_mm + gap_mm
+
+    # 1) edge-based px/mm
+    edge_x = []
+    edge_y = []
+    centers = {}
+    for i, c in id_to_corners.items():
+        w_px, h_px = _aruco_edge_sizes_px(c)
+        edge_x.append(w_px / tag_mm)
+        edge_y.append(h_px / tag_mm)
+        centers[i] = (float(c[:,0].mean()), float(c[:,1].mean()))
+
+    # 2) neighbor-based px/mm from center pitch
+    nbr_x = []
+    nbr_y = []
+
+    def rc_from_id(i: int) -> Tuple[int,int]:
+        if row_major:
+            r = i // cols
+            c = i % cols
+        else:
+            r = i % rows
+            c = i // rows
+        return r, c
+
+    for i in range(rows*cols):
+        r, c = rc_from_id(i)
+        if i in id_set:
+            # right neighbor (same row, next col)
+            if c+1 < cols:
+                j = i+1 if row_major else (i+rows)
+                if j in id_set:
+                    dx = abs(centers[j][0] - centers[i][0])
+                    nbr_x.append(dx / PITCH)
+            # down neighbor (next row)
+            if r+1 < rows:
+                j = i+cols if row_major else (i+1)
+                if j in id_set:
+                    dy = abs(centers[j][1] - centers[i][1])
+                    nbr_y.append(dy / PITCH)
+
+    ex = _robust_median(edge_x)
+    ey = _robust_median(edge_y)
+    nx = _robust_median(nbr_x)
+    ny = _robust_median(nbr_y)
+
+    # Fallback if neighbor list is empty
+    px_per_mm_x = ex if np.isnan(nx) else 0.5*ex + 0.5*nx
+    px_per_mm_y = ey if np.isnan(ny) else 0.5*ey + 0.5*ny
+
+    return {
+        "px_per_mm_x": float(px_per_mm_x),
+        "px_per_mm_y": float(px_per_mm_y),
+        "mm_per_px_x": float(1.0/px_per_mm_x) if px_per_mm_x>1e-12 else float("nan"),
+        "mm_per_px_y": float(1.0/px_per_mm_y) if px_per_mm_y>1e-12 else float("nan"),
+    }
 
 # ======================== Calibration back-end (verbatim) ===================
 
@@ -478,6 +625,46 @@ class CalibrateTab(QtWidgets.QWidget):
         self.captured_gray:   List[np.ndarray] = []
         self.captured_names:  List[str] = []
         self.load_previous_captures()
+        # ==== Restore CalibrateTab settings ====
+        _s = _settings_load().get("calib_tab", {})
+        self.sld_exp["slider"].setValue(int(_s.get("exposure", 5000)))
+        self.sld_gain["slider"].setValue(int(_s.get("gain", 4)))
+        self.sld_foc["slider"].setValue(int(_s.get("focus_x100", 0)))
+        self.cmb_model.setCurrentText(_s.get("model", "pinhole"))
+        self.sp_ag_rows.setValue(int(_s.get("rows", 6)))
+        self.sp_ag_cols.setValue(int(_s.get("cols", 5)))
+        self.dsb_tag_mm.setValue(float(_s.get("tag_mm", 30.0)))
+        self.dsb_gap_mm.setValue(float(_s.get("gap_mm", 6.0)))
+        self.le_family.setText(_s.get("family", "t36h11"))
+        self.le_yaml.setText(_s.get("yaml_path", os.path.abspath("intrinsics.yaml")))
+        # ==== Persist on change (CalibrateTab) ====
+        def _save_calib_settings():
+            data = _settings_load()
+            data["calib_tab"] = {
+                "exposure": int(self.sld_exp["slider"].value()),
+                "gain": int(self.sld_gain["slider"].value()),
+                "focus_x100": int(self.sld_foc["slider"].value()),
+                "model": self.cmb_model.currentText(),
+                "rows": int(self.sp_ag_rows.value()),
+                "cols": int(self.sp_ag_cols.value()),
+                "tag_mm": float(self.dsb_tag_mm.value()),
+                "gap_mm": float(self.dsb_gap_mm.value()),
+                "family": self.le_family.text().strip(),
+                "yaml_path": self.le_yaml.text().strip(),
+            }
+            _settings_save(data)
+
+        for _w in [
+            self.sld_exp["slider"], self.sld_gain["slider"], self.sld_foc["slider"],
+            self.cmb_model, self.sp_ag_rows, self.sp_ag_cols,
+            self.dsb_tag_mm, self.dsb_gap_mm
+        ]:
+            if hasattr(_w, "valueChanged"):
+                _w.valueChanged.connect(_save_calib_settings)
+            elif hasattr(_w, "currentIndexChanged"):
+                _w.currentIndexChanged.connect(_save_calib_settings)
+        self.le_family.textChanged.connect(_save_calib_settings)
+        self.le_yaml.textChanged.connect(_save_calib_settings)
 
         if not HAVE_APRILGRID:
             self.append_log("[ERROR] 'aprilgrid' module not found. Install it and retry.")
@@ -688,25 +875,29 @@ class CalibrateTab(QtWidgets.QWidget):
 
         # Build undistort maps for live
         self.build_undistort_maps()
-        # Compute px↔mm from first capture (based on AprilGrid)
+        # Compute px↔mm from first capture using ArUco (NO intrinsics)
         try:
-            idx = 0  # use the first captured image only
+            idx = 0  # use the first captured image only (you can choose any)
             gray = self.captured_gray[idx]
+            # Use the same UI fields you already have for rows/cols/size/gap, just interpreted as ArUco grid
             rows = int(self.sp_ag_rows.value())
             cols = int(self.sp_ag_cols.value())
             tag_mm = float(self.dsb_tag_mm.value())
             gap_mm = float(self.dsb_gap_mm.value())
-            family = self.le_family.text().strip()
-            pxmm = compute_pxmm_from_aprilgrid(gray, rows, cols, tag_mm, gap_mm, family)
+            # Choose a dictionary; you can later expose this in UI if needed
+            dict_name = "DICT_4X4_50"
+            pxmm = compute_pxmm_from_aruco(gray, rows, cols, tag_mm, gap_mm, dict_name, row_major=True)
             if pxmm:
                 self.pxmm = (pxmm["px_per_mm_x"], pxmm["px_per_mm_y"])
-                self.append_log(f"[SCALE] px/mm: X={pxmm['px_per_mm_x']:.6f}  Y={pxmm['px_per_mm_y']:.6f}")
-                self.append_log(f"[SCALE] mm/px: X={pxmm['mm_per_px_x']:.6f}  Y={pxmm['mm_per_px_y']:.6f}")
+                self.append_log(f"[SCALE] (ArUco) px/mm: X={pxmm['px_per_mm_x']:.6f}  Y={pxmm['px_per_mm_y']:.6f}")
+                self.append_log(f"[SCALE] (ArUco) mm/px: X={pxmm['mm_per_px_x']:.6f}  Y={pxmm['mm_per_px_y']:.6f}")
+                # (Optional) also rewrite YAML so Measure tab can display the same scale
                 self._rewrite_yaml_with_pxmm(res, pxmm, self.le_yaml.text().strip())
             else:
-                self.append_log("[SCALE] Could not compute px/mm (no AprilGrid in first capture).")
+                self.append_log("[SCALE] ArUco grid not found; cannot compute px/mm.")
         except Exception as e:
-            self.append_log(f"[SCALE] Failed to compute px/mm: {e}")
+            self.append_log(f"[SCALE] ArUco px/mm failed: {e}")
+
 
         # Show residual overlay for the last captured frame as quick sanity check
         try:
@@ -892,6 +1083,16 @@ class MeasureTab(QtWidgets.QWidget):
         right.addWidget(self.log, stretch=1)
 
         hbox.addLayout(right, stretch=2)
+        # ==== Restore MeasureTab settings ====
+        _s = _settings_load().get("measure_tab", {})
+        self.le_yaml.setText(_s.get("yaml_path", os.path.abspath("intrinsics.yaml")))
+        self.chk_undist.setChecked(bool(_s.get("undistort", False)))
+        self.sld_exp["slider"].setValue(int(_s.get("exposure", 5000)))
+        self.sld_gain["slider"].setValue(int(_s.get("gain", 4)))
+        self.spin_thick.setValue(int(_s.get("thickness", 2)))
+        # mode: 0=distance,1=angle,2=circle
+        self.cmb_mode.setCurrentIndex(int(_s.get("mode_idx", 0)))
+
 
         # Signals
         self.cam_thread.frame_ready.connect(self.on_frame)
@@ -909,6 +1110,26 @@ class MeasureTab(QtWidgets.QWidget):
 
         self.sld_exp["slider"].valueChanged.connect(self.on_cam_controls)
         self.sld_gain["slider"].valueChanged.connect(self.on_cam_controls)
+        # ==== Persist on change (MeasureTab) ====
+        def _save_measure_settings():
+            data = _settings_load()
+            data["measure_tab"] = {
+                "yaml_path": self.le_yaml.text().strip(),
+                "undistort": bool(self.chk_undist.isChecked()),
+                "exposure": int(self.sld_exp["slider"].value()),
+                "gain": int(self.sld_gain["slider"].value()),
+                "thickness": int(self.spin_thick.value()),
+                "mode_idx": int(self.cmb_mode.currentIndex()),
+            }
+            _settings_save(data)
+
+        # connect
+        self.le_yaml.textChanged.connect(_save_measure_settings)
+        self.chk_undist.toggled.connect(_save_measure_settings)
+        self.sld_exp["slider"].valueChanged.connect(_save_measure_settings)
+        self.sld_gain["slider"].valueChanged.connect(_save_measure_settings)
+        self.spin_thick.valueChanged.connect(_save_measure_settings)
+        self.cmb_mode.currentIndexChanged.connect(_save_measure_settings)
 
         # Auto-load YAML if present
         if os.path.isfile(self.le_yaml.text().strip()):
@@ -1158,7 +1379,6 @@ class MeasureTab(QtWidgets.QWidget):
             return (self.D.size == 4)
         except Exception:
             return False
-
     def load_yaml(self):
         path = self.le_yaml.text().strip()
         if not os.path.isfile(path):
@@ -1168,43 +1388,38 @@ class MeasureTab(QtWidgets.QWidget):
         if not fs.isOpened():
             self.append_log(f"[ERROR] Could not open YAML: {path}")
             return
-        # mandatory
+
+        # Optional intrinsics (for undistort only)
         K = fs.getNode("camera_matrix").mat()
         D = fs.getNode("distortion_coefficients").mat()
-        # optional scale (your calibration script writes these)
+
+        # Optional scale (we prefer these if present)
         pxmmx = fs.getNode("px_per_mm_x").real()
         pxmmy = fs.getNode("px_per_mm_y").real()
         mmppx = fs.getNode("mm_per_px_x").real()
         mmppy = fs.getNode("mm_per_px_y").real()
         fs.release()
 
-        if K is None or D is None:
-            self.append_log("[ERROR] YAML missing camera_matrix/distortion_coefficients.")
-            return
-        self.K = K.astype(np.float64)
-        self.D = D.astype(np.float64)
-        self.map1 = self.map2 = None  # force rebuild
+        self.K = K.astype(np.float64) if K is not None else None
+        self.D = D.astype(np.float64) if D is not None else None
+        self.map1 = self.map2 = None  # force rebuild on undist toggle
 
-        # Follow your original logic strictly
+        # Scale selection: prefer px/mm if written, else mm/px inverse, else unknown
         mmx = mmy = None
         if not np.isnan(pxmmx) and not np.isnan(pxmmy) and pxmmx > 1e-12 and pxmmy > 1e-12:
-            # use px/mm directly (kept as-is per your script)
-            mmx, mmy = float(pxmmx), float(pxmmy)
+            # Here px/mm is stored; convert to mm/px for runtime math
+            mmx, mmy = (1.0/float(pxmmx), 1.0/float(pxmmy))
+            self.lbl_scale.setText(f"px/mm  X={pxmmx:.4f}  Y={pxmmy:.4f}")
         elif not np.isnan(mmppx) and not np.isnan(mmppy) and mmppx > 1e-12 and mmppy > 1e-12:
-            # fallback: invert mm/px
-            mmx, mmy = (1.0/float(mmppx), 1.0/float(mmppy))
-
-        self.mm_per_px = (mmx, mmy) if (mmx is not None and mmy is not None) else None
-
-        if self.mm_per_px:
-            x, y = self.mm_per_px
-            self.lbl_scale.setText(f"px/mm  X={x:.4f}  Y={y:.4f}")
+            mmx, mmy = (float(mmppx), float(mmppy))
+            self.lbl_scale.setText(f"mm/px  X={mmx:.4f}  Y={mmy:.4f}")
         else:
             self.lbl_scale.setText("px/mm: ?  |  mm/px: ?")
 
-        self.append_log("[OK] Loaded intrinsics.")
-        self.append_log("      fisheye=" + str(self.is_fisheye()))
+        self.mm_per_px = (mmx, mmy) if (mmx is not None and mmy is not None) else None
 
+        self.append_log("[OK] Loaded file.")
+        self.append_log("      undistort-ready=" + str(self.K is not None and self.D is not None))
 
 # ======================== Main Window (tabs + shared camera) =================
 
@@ -1245,6 +1460,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.picam.stop()
         except Exception:
             pass
+        # Final flush of settings (optional, since we already save on change)
+        try:
+            d = _settings_load()
+            _settings_save(d)
+        except Exception:
+            pass
+        
         e.accept()
 
 
