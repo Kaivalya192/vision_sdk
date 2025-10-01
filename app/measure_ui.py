@@ -579,10 +579,10 @@ class CalibrateTab(QtWidgets.QWidget):
         # AprilGrid params
         self.grp_april = QtWidgets.QGroupBox("AprilGrid Params")
         form_ag = QtWidgets.QFormLayout(self.grp_april)
-        self.sp_ag_rows = QtWidgets.QSpinBox(); self.sp_ag_rows.setRange(2, 20); self.sp_ag_rows.setValue(6)
-        self.sp_ag_cols = QtWidgets.QSpinBox(); self.sp_ag_cols.setRange(2, 20); self.sp_ag_cols.setValue(5)
+        self.sp_ag_rows = QtWidgets.QSpinBox(); self.sp_ag_rows.setRange(2, 20); self.sp_ag_rows.setValue(6)   # rows
+        self.sp_ag_cols = QtWidgets.QSpinBox(); self.sp_ag_cols.setRange(2, 20); self.sp_ag_cols.setValue(5)   # cols
         self.dsb_tag_mm = QtWidgets.QDoubleSpinBox(); self.dsb_tag_mm.setRange(1, 1000); self.dsb_tag_mm.setValue(30.0)
-        self.dsb_gap_mm = QtWidgets.QDoubleSpinBox(); self.dsb_gap_mm.setRange(0, 1000); self.dsb_gap_mm.setValue(6.0)
+        self.dsb_gap_mm = QtWidgets.QDoubleSpinBox(); self.dsb_gap_mm.setRange(0, 1000); self.dsb_gap_mm.setValue(9.0)  # <-- was 6.0
         self.le_family  = QtWidgets.QLineEdit("t36h11")
         form_ag.addRow("Rows", self.sp_ag_rows)
         form_ag.addRow("Cols", self.sp_ag_cols)
@@ -875,26 +875,29 @@ class CalibrateTab(QtWidgets.QWidget):
 
         # Build undistort maps for live
         self.build_undistort_maps()
-        # Compute px↔mm from first capture using ArUco (NO intrinsics)
+        # Compute px↔mm from first capture using AprilGrid ONLY (NO intrinsics)
         try:
-            idx = 0  # use the first captured image only (you can choose any)
+            idx = 0  # use the first captured image
             gray = self.captured_gray[idx]
-            # Use the same UI fields you already have for rows/cols/size/gap, just interpreted as ArUco grid
-            rows = int(self.sp_ag_rows.value())
-            cols = int(self.sp_ag_cols.value())
-            tag_mm = float(self.dsb_tag_mm.value())
-            gap_mm = float(self.dsb_gap_mm.value())
-            # Choose a dictionary; you can later expose this in UI if needed
-            dict_name = "DICT_4X4_50"
-            pxmm = compute_pxmm_from_aruco(gray, rows, cols, tag_mm, gap_mm, dict_name, row_major=True)
+
+            rows = int(self.sp_ag_rows.value())   # 6 for your board
+            cols = int(self.sp_ag_cols.value())   # 5 for your board
+            tag_mm = float(self.dsb_tag_mm.value())   # 30
+            gap_mm = float(self.dsb_gap_mm.value())   # 9
+            family = self.le_family.text().strip()    # "t36h11"
+
+            pxmm = compute_pxmm_from_aprilgrid(gray, rows, cols, tag_mm, gap_mm, family)
             if pxmm:
                 self.pxmm = (pxmm["px_per_mm_x"], pxmm["px_per_mm_y"])
-                self.append_log(f"[SCALE] (ArUco) px/mm: X={pxmm['px_per_mm_x']:.6f}  Y={pxmm['px_per_mm_y']:.6f}")
-                self.append_log(f"[SCALE] (ArUco) mm/px: X={pxmm['mm_per_px_x']:.6f}  Y={pxmm['mm_per_px_y']:.6f}")
-                # (Optional) also rewrite YAML so Measure tab can display the same scale
+                self.append_log(f"[SCALE] (AprilGrid) px/mm: X={pxmm['px_per_mm_x']:.6f}  Y={pxmm['px_per_mm_y']:.6f}")
+                self.append_log(f"[SCALE] (AprilGrid) mm/px: X={pxmm['mm_per_px_x']:.6f}  Y={pxmm['mm_per_px_y']:.6f}")
+                # Write px/mm into YAML so the Measure tab can show/use it
                 self._rewrite_yaml_with_pxmm(res, pxmm, self.le_yaml.text().strip())
             else:
-                self.append_log("[SCALE] ArUco grid not found; cannot compute px/mm.")
+                self.append_log("[SCALE] AprilGrid not found in first capture; cannot compute px/mm.")
+        except Exception as e:
+            self.append_log(f"[SCALE] AprilGrid px/mm failed: {e}")
+
         except Exception as e:
             self.append_log(f"[SCALE] ArUco px/mm failed: {e}")
 
