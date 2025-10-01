@@ -877,7 +877,7 @@ class CalibrateTab(QtWidgets.QWidget):
         self.build_undistort_maps()
         # Compute px↔mm from first capture using AprilGrid ONLY (NO intrinsics)
         try:
-            idx = 0  # use the first captured image
+            idx = 0
             gray = self.captured_gray[idx]
 
             rows = int(self.sp_ag_rows.value())   # 6 for your board
@@ -886,21 +886,18 @@ class CalibrateTab(QtWidgets.QWidget):
             gap_mm = float(self.dsb_gap_mm.value())   # 9
             family = self.le_family.text().strip()    # "t36h11"
 
-            pxmm = compute_pxmm_from_aprilgrid(gray, rows, cols, tag_mm, gap_mm, family)
+            # FORCE edge-only scale (no neighbor pitch), and keep bias correction on.
+            pxmm = compute_pxmm_from_aprilgrid(gray, rows, cols, tag_mm, gap_mm, family,
+                                            pair_weight=0.0, bias_blend=1.0)
             if pxmm:
                 self.pxmm = (pxmm["px_per_mm_x"], pxmm["px_per_mm_y"])
-                self.append_log(f"[SCALE] (AprilGrid) px/mm: X={pxmm['px_per_mm_x']:.6f}  Y={pxmm['px_per_mm_y']:.6f}")
-                self.append_log(f"[SCALE] (AprilGrid) mm/px: X={pxmm['mm_per_px_x']:.6f}  Y={pxmm['mm_per_px_y']:.6f}")
-                # Write px/mm into YAML so the Measure tab can show/use it
+                self.append_log(f"[SCALE] (AprilGrid, edge-only) px/mm: X={pxmm['px_per_mm_x']:.6f}  Y={pxmm['px_per_mm_y']:.6f}")
+                self.append_log(f"[SCALE] (AprilGrid, edge-only) mm/px: X={pxmm['mm_per_px_x']:.6f}  Y={pxmm['mm_per_px_y']:.6f}")
                 self._rewrite_yaml_with_pxmm(res, pxmm, self.le_yaml.text().strip())
             else:
                 self.append_log("[SCALE] AprilGrid not found in first capture; cannot compute px/mm.")
         except Exception as e:
             self.append_log(f"[SCALE] AprilGrid px/mm failed: {e}")
-
-        except Exception as e:
-            self.append_log(f"[SCALE] ArUco px/mm failed: {e}")
-
 
         # Show residual overlay for the last captured frame as quick sanity check
         try:
@@ -1192,7 +1189,10 @@ class MeasureTab(QtWidgets.QWidget):
         txt = f"{img.shape[1]}x{img.shape[0]}  undist={self.undistort}"
         if self.mm_per_px:
             xmm, ymm = self.mm_per_px
-            txt += f"  mm/px: X={xmm:.3f}  Y={ymm:.3f}"
+            # also display px/mm for quick sanity checks
+            pxmmx = (1.0/xmm) if xmm > 1e-12 else float('nan')
+            pxmmy = (1.0/ymm) if ymm > 1e-12 else float('nan')
+            txt += f"  mm/px: X={xmm:.3f} Y={ymm:.3f}  |  px/mm: X={pxmmx:.3f} Y={pxmmy:.3f}"
         cv2.putText(img, txt, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,60), 2, cv2.LINE_AA)
         return img
 
