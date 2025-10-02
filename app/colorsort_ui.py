@@ -12,6 +12,88 @@ import socket
 
 from PyQt5 import QtCore, QtGui, QtWidgets, QtWebSockets
 
+import threading
+class QtTriggerBridge(QtCore.QObject):
+    triggerReceived = QtCore.pyqtSignal()
+
+class QtTriggerListener:
+    """
+    Background UDP listener. Accepts either b'TRIGGER' or JSON {"cmd":"trigger"}.
+    Emits QtTriggerBridge.triggerReceived() in the GUI thread.
+    """
+    def __init__(self, bridge: QtTriggerBridge, bind_ip="0.0.0.0", port=40002, log=print, enable_broadcast=False):
+        self.bridge = bridge
+        self._ip = bind_ip
+        self._port = int(port)
+        self._log = log
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if enable_broadcast:
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self._sock.bind((self._ip, self._port))
+            self._sock.settimeout(0.5)
+            self._log(f"[UDP] BOUND OK on {self._ip}:{self._port}")
+        except Exception as e:
+            self._log(f"[UDP][BIND ERROR] {e} (ip={self._ip}, port={self._port})")
+            try: self._sock.close()
+            except: pass
+            self._sock = None
+
+    def start(self):
+        if self._sock is None:
+            self._log("[UDP] Listener NOT STARTED (socket not bound).")
+            return
+        self._log(f"[UDP] START thread; listening on {self._ip}:{self._port}")
+        self._thr.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except Exception:
+            pass
+
+    def _loop(self):
+        if self._sock is None:
+            return
+        while not self._stop.is_set():
+            try:
+                data, addr = self._sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as e:
+                self._log(f"[UDP][RECV ERROR] {e}")
+                continue
+
+            self._log(f"[UDP] FROM {addr[0]}:{addr[1]}  {data!r}")
+
+            msg = data.decode("utf-8", errors="ignore").strip()
+            fire = (msg.upper() == "TRIGGER")
+            parsed = "text"
+            if not fire:
+                try:
+                    j = json.loads(msg)
+                    parsed = "json"
+                    fire = isinstance(j, dict) and str(j.get("cmd","")).lower() == "trigger"
+                except Exception:
+                    parsed = "other"
+
+            self._log(f"[UDP] parsed={parsed} fire={fire}")
+            if fire:
+                self._log("[UDP] >>> TRIGGER RECEIVED <<<")
+                try:
+                    self._sock.sendto(b'{"status":"armed"}', addr)  # optional ACK
+                except Exception:
+                    pass
+                self.bridge.triggerReceived.emit()
 
 # ------------------------ Video Label (keeps aspect + ROI + pixel click) ------------------------
 
@@ -401,6 +483,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pick_enabled = False
         self._last_overlay: Optional[QtGui.QImage] = None
         self._overlay_until = 0.0
+        self._expect_one_result = False
+        self._last_result_time = 0.0
+
 
         # central: left controls + video
         central = QtWidgets.QWidget()
@@ -578,7 +663,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_conn.clicked.connect(lambda: self.ws.open(QtCore.QUrl(self.ed_host.text().strip())))
         self.btn_disc.clicked.connect(self.ws.close)
         self.rad_train.toggled.connect(lambda: self._send({"type": "set_mode", "mode": "training" if self.rad_train.isChecked() else "trigger"}))
-        self.btn_trig.clicked.connect(lambda: self._send({"type": "trigger"}))
+        self.btn_trig.clicked.connect(self._do_trigger)
         self.cmb_w.currentTextChanged.connect(lambda w: self._send({"type": "set_proc_width", "width": int(w)}))
         self.sp_every.valueChanged.connect(lambda n: self._send({"type": "set_publish_every", "n": int(n)}))
         self.cam_panel.paramsChanged.connect(lambda p: self._send({"type": "set_params", "params": p}))
@@ -597,6 +682,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._ping = QtCore.QTimer(interval=10000, timeout=lambda: self._send({"type": "ping"}))
         self._load_settings()
+        # ----- UDP trigger listener -----
+        self._udp_bridge = QtTriggerBridge()
+        self._udp_bridge.triggerReceived.connect(self._on_udp_trigger)
+        self._udp_listener = QtTriggerListener(
+            self._udp_bridge,
+            bind_ip="0.0.0.0",
+            port=40002,               # matches your robot->UI trigger port
+            log=self._append_log,
+            enable_broadcast=False
+        )
+        self._udp_listener.start()
+        
+    def _on_udp_trigger(self):
+        # Switch to Trigger mode and fire a single detection (same as pressing TRIGGER button)
+        if not self.rad_trig.isChecked():
+            self.rad_trig.setChecked(True)  # this also sends set_mode via your existing signal
+        self._append_log("UDP trigger → requesting one detection…")
+        self._expect_one_result = True
+        self._send({"type": "trigger"})
+
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "controlsPanel", None) and event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.Show):
@@ -608,7 +713,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return super().eventFilter(obj, event)
 
     # -------------- helpers --------------
-
+    def _do_trigger(self):
+        if self.rad_trig.isChecked():
+            self._send({"type": "trigger"})
+            self._append_log("Trigger pressed → waiting for one detection…")
+            self._expect_one_result = True
     def _append_log(self, text: str):
         ts = time.strftime("%H:%M:%S")
         entry = f"[{ts}] {text}"
@@ -627,55 +736,94 @@ class MainWindow(QtWidgets.QMainWindow):
         pw, ph = (int(self.last_frame_wh[0]), int(self.last_frame_wh[1])) if self.last_frame_wh != (0, 0) else (0, 0)
         return {
             "version": "1.0",
-            "sdk": "vision_ui_color",
+            "sdk": "vision_ui",                     # <— was "vision_ui_color"; make it EXACT
             "session": self.session_id,
             "timestamp_ms": int(time.time() * 1000),
             "camera": {"proc_width": pw, "proc_height": ph},
-            "result": {"counts": {"objects": 0, "detections": 0}, "objects": []}
+            "result": {"objects": [], "counts": {"objects": 0, "detections": 0}}
         }
 
     def _publish_color_result_to_robot(self, server_msg: Dict):
         """
-        server_msg is the dict received on 'color_results' (your current msg).
-        We convert its 'objects' list into the VisionResult envelope expected by the robot side.
+        Convert server 'color_results' ({objects: [{class_name, area, centroid, circularity, score?}, ...]})
+        into the strict VisionResult envelope expected by vgr_manager: each class -> one object,
+        each blob -> one detection with pose, center, quad, template_size, color metrics, counts.
         """
-        base = self._base_payload()
-
-        # Expecting: server_msg["objects"] = [{class_name, area, centroid [x,y], circularity}, ...]
+        base = self._base_payload()  # already sdk="vision_ui"
         src_objs = server_msg.get("objects") or []
 
-        # Group detections by class_name → one "object" per class with multiple "detections"
+        # Group detections by class name
         by_class: Dict[str, List[dict]] = {}
         for d in src_objs:
             cname = str(d.get("class_name", "unknown"))
             by_class.setdefault(cname, []).append(d)
 
         objects_out: List[dict] = []
-        for i, (cname, dets_raw) in enumerate(sorted(by_class.items(), key=lambda kv: kv[0].lower())):
+        total_dets = 0
+
+        for obj_id, (cname, dets_raw) in enumerate(sorted(by_class.items(), key=lambda kv: kv[0].lower())):
             dets_out = []
-            for j, d in enumerate(dets_raw):
+            for inst_id, d in enumerate(dets_raw):
                 cx, cy = (d.get("centroid") or [0, 0])[:2]
+                area = float(d.get("area", 0.0))
+                circ = float(d.get("circularity", -1.0))
+                score = float(d.get("score", 0.5))   # default if not provided
+                inliers = int(d.get("inliers", 30))  # harmless default
+
+                # Approximate a square support from area:
+                s = max(1.0, area ** 0.5)
+                w = h = s
+                half = s / 2.0
+                # Axis-aligned quad around center (TL, TR, BR, BL) to match your sample ordering
+                tl = [cx - half, cy - half]
+                tr = [cx + half, cy - half]
+                br = [cx + half, cy + half]
+                bl = [cx - half, cy + half]
+                quad = [tl, tr, br, bl]
+
+                # Minimal pose synthesized from center (no real angle info here)
+                pose = {
+                    "x": float(cx),
+                    "y": float(cy),
+                    "theta_deg": 0.0,
+                    "x_scale": 1.0,
+                    "y_scale": 1.0,
+                    "origin_xy": [float(cx), float(cy)]
+                }
+
                 dets_out.append({
-                    "instance_id": j,
+                    "instance_id": inst_id,
+                    "score": score,
+                    "inliers": inliers,
+                    "pose": pose,
                     "center": [float(cx), float(cy)],
-                    "area": int(d.get("area", 0)),
-                    "circularity": float(d.get("circularity", 0.0)),
-                    # optional fields used elsewhere; left here if planning needs them later:
-                    "score": float(d.get("score", 1.0))
+                    "quad": quad,
+                    "color": {
+                        # Keep semantics compatible with your sample
+                        "bhattacharyya": -1.0 if circ < 0 else circ,   # or leave circ separate; sample showed -1.0
+                        "correlation": -1.0,
+                        "deltaE": -1.0
+                    }
                 })
+
+            total_dets += len(dets_out)
+
+            # template_size: approximate from square side 's'
+            template_size = [int(round(w)), int(round(h))]
+
             objects_out.append({
-                "object_id": i,
+                "object_id": obj_id,
                 "name": cname,
+                "template_size": template_size,
                 "detections": dets_out
             })
 
         base["result"]["objects"] = objects_out
-        dets_count = sum(len(o["detections"]) for o in objects_out)
-        base["result"]["counts"] = {"objects": len(objects_out), "detections": dets_count}
+        base["result"]["counts"] = {"objects": len(objects_out), "detections": total_dets}
 
-        if self.chk_pub_robot.isChecked() and dets_count > 0:
+        if self.chk_pub_robot.isChecked() and total_dets > 0:
             self.pub_robot.send_json(base)
-            self._append_log(f"UDP → robot: classes={len(objects_out)} dets={dets_count}")
+            self._append_log(f"UDP → robot (STRICT): classes={len(objects_out)} dets={total_dets}")
 
     def _decode_b64_to_qimage_and_bgr(self, b64: str) -> Tuple[Optional[QtGui.QImage], Optional[np.ndarray]]:
         try:
@@ -754,7 +902,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._fps_acc = 0
                 self._fps_n = 0
 
-            self._set_pixmap(qi)
+            # If we have an overlay still valid, keep showing it
+            if self._last_overlay and time.time() < self._overlay_until:
+                self._set_pixmap(self._last_overlay)
+            else:
+                self._set_pixmap(qi)
+
 
         elif t == "color_results":
             self._update_color_results(msg)
@@ -936,6 +1089,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"Sent {len(self._classes)} classes (k={self._kernel}, min_area={self._min_area_global})")
 
     def _update_color_results(self, msg: Dict):
+        if self.rad_trig.isChecked():
+            if not self._expect_one_result:
+                # allow persisting for 1s
+                if time.time() - self._last_result_time < 1.0:
+                    return  # keep showing old result
+                else:
+                    # clear after 1 sec
+                    self.tbl.setRowCount(0)
+                    return
+        self._expect_one_result = False
+        self._last_result_time = time.time()
+
         objs = msg.get("objects", []) or []
         self.tbl.setRowCount(0)
         for d in objs:
@@ -1097,9 +1262,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         try:
             self._save_settings()
+            try:
+                if hasattr(self, "_udp_listener") and self._udp_listener:
+                    self._udp_listener.stop()
+            except Exception:
+                pass
         finally:
             super().closeEvent(event)
-
 
 def main():
     app = QtWidgets.QApplication(sys.argv)

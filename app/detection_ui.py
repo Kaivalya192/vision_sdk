@@ -3,6 +3,8 @@
 RPi Vision Client – Detection-only UI (pattern matching)
 """
 
+import os
+import threading
 import sys, time, base64, json
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -343,6 +345,88 @@ class CameraPanel(QtWidgets.QWidget):
         self.dsb_awb_r.setEnabled(manual)
         self.dsb_awb_b.setEnabled(manual)
 
+# --- UDP Trigger Listener (robot -> UI) ---
+class QtTriggerBridge(QtCore.QObject):
+    triggerReceived = QtCore.pyqtSignal()
+
+class QtTriggerListener:
+    """
+    Background UDP listener. Accepts either b'TRIGGER' or JSON {"cmd":"trigger"}.
+    Emits QtTriggerBridge.triggerReceived() in the GUI thread.
+    """
+    def __init__(self, bridge: QtTriggerBridge, bind_ip="0.0.0.0", port=40002, log=print, enable_broadcast=False):
+        self.bridge = bridge
+        self._ip = bind_ip
+        self._port = int(port)
+        self._log = log
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if enable_broadcast:
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self._sock.bind((self._ip, self._port))
+            self._sock.settimeout(0.5)
+            self._log(f"[UDP] BOUND OK on {self._ip}:{self._port}")
+        except Exception as e:
+            self._log(f"[UDP][BIND ERROR] {e} (ip={self._ip}, port={self._port})")
+            try: self._sock.close()
+            except: pass
+            self._sock = None
+
+    def start(self):
+        if self._sock is None:
+            self._log("[UDP] Listener NOT STARTED (socket not bound).")
+            return
+        self._log(f"[UDP] START thread; listening on {self._ip}:{self._port}")
+        self._thr.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except Exception:
+            pass
+
+    def _loop(self):
+        if self._sock is None:
+            return
+        while not self._stop.is_set():
+            try:
+                data, addr = self._sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as e:
+                self._log(f"[UDP][RECV ERROR] {e}")
+                continue
+
+            self._log(f"[UDP] FROM {addr[0]}:{addr[1]}  {data!r}")
+
+            msg = data.decode("utf-8", errors="ignore").strip()
+            fire = (msg.upper() == "TRIGGER")
+            parsed = "text"
+            if not fire:
+                try:
+                    j = json.loads(msg)
+                    parsed = "json"
+                    fire = isinstance(j, dict) and str(j.get("cmd","")).lower() == "trigger"
+                except Exception:
+                    parsed = "other"
+
+            self._log(f"[UDP] parsed={parsed} fire={fire}")
+            if fire:
+                self._log("[UDP] >>> TRIGGER RECEIVED <<<")
+                try:
+                    self._sock.sendto(b'{"status":"armed"}', addr)  # optional ACK
+                except Exception:
+                    pass
+                self.bridge.triggerReceived.emit()
 
 # ------------------------ Main Window (detection only) ------------------------
 
@@ -544,6 +628,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.afTriggerRequested.connect(lambda: self._send({"type": "af_trigger"}))
         self.video.roiSelected.connect(self._rect_roi)
         self.video.polygonSelected.connect(self._poly_roi)
+        # --- Start UDP trigger listener ---
+        TRIGGER_BIND_IP = os.environ.get("VISION_UI_BIND_IP", "0.0.0.0")
+        TRIGGER_PORT    = int(os.environ.get("VISION_UI_BIND_PORT", "40002"))
+
+        self._trigger_bridge = QtTriggerBridge()
+        self._trigger_bridge.triggerReceived.connect(self.on_robot_trigger)
+
+        self._trigger_listener = QtTriggerListener(
+            bridge=self._trigger_bridge,
+            bind_ip=TRIGGER_BIND_IP,
+            port=TRIGGER_PORT,
+            log=self._append_log,          # log to the Results panel
+            enable_broadcast=False         # set True if your robot uses broadcast
+        )
+        self._trigger_listener.start()
 
         self._ping = QtCore.QTimer(interval=10000, timeout=lambda: self._send({"type": "ping"}))
         self._load_settings()
@@ -582,6 +681,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.chk_pub_robot.isChecked() and dets > 0:
             self.pub_robot.send_json(base)
             self._append_log(f"UDP → robot: objects={len(objs)} dets={dets}")
+            
+    @QtCore.pyqtSlot()
+    def on_robot_trigger(self):
+        # Loud UI feedback
+        self._append_log("[UDP] Handling trigger → forwarding to server")
+        try:
+            self.status.showMessage("UDP TRIGGER received", 2000)
+        except Exception:
+            pass
+        # Forward to your server exactly like the TRIGGER button does
+        self._send({"type": "trigger"})
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "controlsPanel", None) and event.type() in (QtCore.QEvent.Hide, QtCore.QEvent.Show):
@@ -986,6 +1096,10 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def closeEvent(self, event):
+        try:
+            self._trigger_listener.stop()
+        except Exception:
+            pass
         try:
             self._save_settings()
         finally:
