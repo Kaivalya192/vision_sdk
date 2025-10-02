@@ -466,34 +466,40 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Connection
         conn_box = QtWidgets.QGroupBox("Connection")
-        ch = QtWidgets.QHBoxLayout(conn_box)
+        cf = QtWidgets.QFormLayout(conn_box)
         self.ed_host = QtWidgets.QLineEdit("ws://192.168.1.2:8765")
         self.btn_conn = QtWidgets.QPushButton("Connect")
         self.btn_disc = QtWidgets.QPushButton("Disconnect"); self.btn_disc.setEnabled(False)
 
-        # --- ADD: robot UDP target + auto-publish toggle ---
         self.ed_robot_ip = QtWidgets.QLineEdit("192.168.1.50")
         self.sp_robot_port = QtWidgets.QSpinBox(); self.sp_robot_port.setRange(1, 65535); self.sp_robot_port.setValue(40001)
         self.chk_pub_robot = QtWidgets.QCheckBox("Auto publish to robot"); self.chk_pub_robot.setChecked(True)
 
-        for w in (self.ed_host, self.btn_conn, self.btn_disc,
-                QtWidgets.QLabel(" Robot:"), self.ed_robot_ip, self.sp_robot_port, self.chk_pub_robot):
-            ch.addWidget(w)
+        cf.addRow("Server", self.ed_host)
+        cf.addRow("", self.btn_conn)
+        cf.addRow("", self.btn_disc)
+        cf.addRow("Robot IP", self.ed_robot_ip)
+        cf.addRow("Robot Port", self.sp_robot_port)
+        cf.addRow("", self.chk_pub_robot)
         left_v.addWidget(conn_box)
+
 
         # --- ADD: UDP publisher instance + live target binding ---
         self.pub_robot = RobotUDPPublisher(self.ed_robot_ip.text(), int(self.sp_robot_port.value()))
         self.ed_robot_ip.textChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
         self.sp_robot_port.valueChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
 
-        # Mode
         mode_box = QtWidgets.QGroupBox("Mode")
-        mh = QtWidgets.QHBoxLayout(mode_box)
-        self.rad_train = QtWidgets.QRadioButton("Training"); self.rad_trig = QtWidgets.QRadioButton("Trigger")
+        mv = QtWidgets.QVBoxLayout(mode_box)
+        self.rad_train = QtWidgets.QRadioButton("Training")
+        self.rad_trig = QtWidgets.QRadioButton("Trigger")
         self.rad_train.setChecked(True)
         self.btn_trig = QtWidgets.QPushButton("TRIGGER")
-        mh.addWidget(self.rad_train); mh.addWidget(self.rad_trig); mh.addStretch(1); mh.addWidget(self.btn_trig)
+        mv.addWidget(self.rad_train)
+        mv.addWidget(self.rad_trig)
+        mv.addWidget(self.btn_trig)
         left_v.addWidget(mode_box)
+
 
         # Processing
         proc_box = QtWidgets.QGroupBox("Processing")
@@ -508,26 +514,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Templates
         tmpl_box = QtWidgets.QGroupBox("Templates")
-        tv = QtWidgets.QVBoxLayout(tmpl_box)
-        row = QtWidgets.QHBoxLayout()
+        tf = QtWidgets.QFormLayout(tmpl_box)
         self.cmb_slot = QtWidgets.QComboBox(); [self.cmb_slot.addItem(f"{i+1}") for i in range(5)]
         self.ed_name = QtWidgets.QLineEdit("Obj1")
         self.sp_max = QtWidgets.QSpinBox(); self.sp_max.setRange(1, 10); self.sp_max.setValue(3)
         self.chk_en = QtWidgets.QCheckBox("Enabled"); self.chk_en.setChecked(True)
-        for w in (QtWidgets.QLabel("Slot"), self.cmb_slot, QtWidgets.QLabel("Name"), self.ed_name,
-                  QtWidgets.QLabel("Max"), self.sp_max, self.chk_en):
-            row.addWidget(w)
-        tv.addLayout(row)
+
+        tf.addRow("Slot", self.cmb_slot)
+        tf.addRow("Name", self.ed_name)
+        tf.addRow("Max", self.sp_max)
+        tf.addRow("", self.chk_en)
         left_v.addWidget(tmpl_box)
+
 
         # Detect controls (ROI capture)
         det_box = QtWidgets.QGroupBox("Detect")
-        dh = QtWidgets.QHBoxLayout(det_box)
+        dv = QtWidgets.QVBoxLayout(det_box)
         self.btn_rect = QtWidgets.QPushButton("Capture Rect")
         self.btn_poly = QtWidgets.QPushButton("Capture Poly")
         self.btn_clear = QtWidgets.QPushButton("Clear Active")
-        for w in (self.btn_rect, self.btn_poly, self.btn_clear): dh.addWidget(w)
+        dv.addWidget(self.btn_rect)
+        dv.addWidget(self.btn_poly)
+        dv.addWidget(self.btn_clear)
         left_v.addWidget(det_box)
+
 
         # Detection settings
         det_cfg = QtWidgets.QGroupBox("Detection Settings")
@@ -551,19 +561,20 @@ class MainWindow(QtWidgets.QMainWindow):
             w.valueChanged.connect(lambda *_: self._det_settings_timer.start())
         left_v.addWidget(det_cfg)
 
-        # Detections table
-        det_tbl = QtWidgets.QGroupBox("Detections")
-        dv = QtWidgets.QVBoxLayout(det_tbl)
-        self.tbl = QtWidgets.QTableWidget(0, 8)
-        self.tbl.setHorizontalHeaderLabels(["Obj", "Id", "x", "y", "θ", "score", "inliers", "center"])
-        self.tbl.horizontalHeader().setStretchLastSection(True)
-        dv.addWidget(self.tbl)
-        left_v.addWidget(det_tbl, 1)
+        # Logs box (moved from right dock)
+        log_box = QtWidgets.QGroupBox("Logs")
+        lv = QtWidgets.QVBoxLayout(log_box)
+        self.txt_log = QtWidgets.QTextEdit()
+        self.txt_log.setReadOnly(True)
+        lv.addWidget(self.txt_log, 1)
+        left_v.addWidget(log_box, 1)
+
 
         left_v.addStretch(1)
 
         self.controlsPanel = QtWidgets.QScrollArea()
         self.controlsPanel.setWidgetResizable(True)
+        self.controlsPanel.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.controlsPanel.setWidget(left_panel)
         root.addWidget(self.controlsPanel, 0)
 
@@ -573,15 +584,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video.setStyleSheet("background:#111;")
         root.addWidget(self.video, 1)
 
-        # Results dock (Log only)
-        self.resultsDock = QtWidgets.QDockWidget("Results", self)
+        # Results dock (Detections table)
+        self.resultsDock = QtWidgets.QDockWidget("Detections", self)
         self.resultsDock.setAllowedAreas(QtCore.Qt.RightDockWidgetArea)
         self.resultsDock.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable |
                                      QtWidgets.QDockWidget.DockWidgetMovable |
                                      QtWidgets.QDockWidget.DockWidgetFloatable)
         dockw = QtWidgets.QWidget(); dlay = QtWidgets.QVBoxLayout(dockw)
-        self.txt_log = QtWidgets.QTextEdit(); self.txt_log.setReadOnly(True)
-        dlay.addWidget(QtWidgets.QLabel("Log")); dlay.addWidget(self.txt_log, 1)
+        self.tbl = QtWidgets.QTableWidget(0, 8)
+        self.tbl.setHorizontalHeaderLabels(["Obj", "Id", "x", "y", "θ", "score", "inliers", "center"])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        dlay.addWidget(self.tbl, 1)
         self.resultsDock.setWidget(dockw)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.resultsDock)
 

@@ -498,37 +498,40 @@ class MainWindow(QtWidgets.QMainWindow):
         left_panel = QtWidgets.QWidget()
         left_v = QtWidgets.QVBoxLayout(left_panel)
         left_v.setSpacing(10)
-
-        # Connection
+        
         conn_box = QtWidgets.QGroupBox("Connection")
-        ch = QtWidgets.QHBoxLayout(conn_box)
+        cf = QtWidgets.QFormLayout(conn_box)
         self.ed_host = QtWidgets.QLineEdit("ws://192.168.1.2:8765")
         self.btn_conn = QtWidgets.QPushButton("Connect")
         self.btn_disc = QtWidgets.QPushButton("Disconnect"); self.btn_disc.setEnabled(False)
-
-        # ---- ADD: robot UDP target + auto-publish toggle
         self.ed_robot_ip = QtWidgets.QLineEdit("192.168.1.50")
-        self.sp_robot_port = QtWidgets.QSpinBox(); self.sp_robot_port.setRange(1, 65535); self.sp_robot_port.setValue(40001)
+        self.sp_robot_port = QtWidgets.QSpinBox(); self.sp_robot_port.setRange(1,65535); self.sp_robot_port.setValue(40001)
         self.chk_pub_robot = QtWidgets.QCheckBox("Auto publish to robot"); self.chk_pub_robot.setChecked(True)
 
-        for w in (self.ed_host, self.btn_conn, self.btn_disc,
-                QtWidgets.QLabel(" Robot:"), self.ed_robot_ip, self.sp_robot_port, self.chk_pub_robot):
-            ch.addWidget(w)
+        cf.addRow("Server:", self.ed_host)
+        cf.addRow("", self.btn_conn)
+        cf.addRow("", self.btn_disc)
+        cf.addRow("Robot IP:", self.ed_robot_ip)
+        cf.addRow("Robot Port:", self.sp_robot_port)
+        cf.addRow("", self.chk_pub_robot)
         left_v.addWidget(conn_box)
 
         # ---- ADD: UDP publisher instance + live target binding
         self.pub_robot = RobotUDPPublisher(self.ed_robot_ip.text(), int(self.sp_robot_port.value()))
         self.ed_robot_ip.textChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
         self.sp_robot_port.valueChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
-
-        # Mode
+        
         mode_box = QtWidgets.QGroupBox("Mode")
-        mh = QtWidgets.QHBoxLayout(mode_box)
-        self.rad_train = QtWidgets.QRadioButton("Training"); self.rad_trig = QtWidgets.QRadioButton("Trigger")
+        mv = QtWidgets.QVBoxLayout(mode_box)
+        self.rad_train = QtWidgets.QRadioButton("Training")
+        self.rad_trig = QtWidgets.QRadioButton("Trigger")
         self.rad_train.setChecked(True)
         self.btn_trig = QtWidgets.QPushButton("TRIGGER")
-        mh.addWidget(self.rad_train); mh.addWidget(self.rad_trig); mh.addStretch(1); mh.addWidget(self.btn_trig)
+        mv.addWidget(self.rad_train)
+        mv.addWidget(self.rad_trig)
+        mv.addWidget(self.btn_trig)
         left_v.addWidget(mode_box)
+
 
         # Processing (reuse proc width + cadence to keep parity with detection)
         proc_box = QtWidgets.QGroupBox("Processing")
