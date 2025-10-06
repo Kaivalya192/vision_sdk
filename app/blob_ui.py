@@ -1,72 +1,20 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-RPi Vision Client – Canny Contour UI (Industrial Template Matching)
-- Receives frames over WS, applies Canny + contouring (no other binarizers).
-- "Teach from ROI" captures template contours into a library (named).
-- Runtime matches detections to the selected template via cv2.matchShapes
-  (I1/I2/I3 selectable) + area/perimeter tolerances.
-- Publishes GO/NOGO + bbox to robot over UDP (best passing match).
-
-Extras:
-- CLAHE (optional) + Gaussian blur before Canny.
-- Edge dilation (optional) to stabilize contours.
-- Filters: area, aspect, solidity, perimeter, keep top-N.
-- Template Library: add/remove/rename/select, save/load to JSON.
+RPi Vision Client – Blob UI (Industrial Blob Inspection, GO/NOGO)
+- Mirrors your Canny Contour UI’s structure (WS video in, UDP trigger, VGR JSON out).
+- Blob pipeline with configurable thresholding, polarity, morphology, and filters.
+- GO/NOGO rules (area, circularity, solidity, aspect, holes, intensity) decide publish name.
 
 Requires: PyQt5, numpy, opencv-python
 """
 
-import sys, time, base64, json, socket, threading, inspect, os
+import sys, time, base64, json, socket, threading, inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets, QtWebSockets
-# --- PaddleOCR stability flags (same as your OCR app) ---
-import os as _os
-_os.environ.setdefault("FLAGS_use_mkldnn", "0")
-_os.environ.setdefault("FLAGS_enable_mkldnn", "0")
-_os.environ.setdefault("ONEDNN_PRIMITIVE_CACHE_CAPACITY", "0")
-_os.environ.setdefault("OMP_NUM_THREADS", "1")
-_os.environ.setdefault("MKL_NUM_THREADS", "1")
-
-
-def _lazy_paddleocr():
-    import re
-    from paddleocr import PaddleOCR, __version__ as _pocr_ver
-
-    def _parse_ver(s: str):
-        m = re.findall(r"\d+", s)
-        while len(m) < 3:
-            m.append("0")
-        return tuple(int(x) for x in m[:3])
-
-    v = _parse_ver(_pocr_ver)  # e.g., (3, 2, 0)
-
-    if v >= (3, 0, 0):
-        # PaddleOCR 3.x — new arg names, and `max_batch_size` was removed.
-        return PaddleOCR(
-            device='cpu',
-            use_textline_orientation=True,
-            lang='en',
-            # renamed parameters (only set if you want to override defaults):
-            text_detection_model_dir=None,      # was det_model_dir
-            text_recognition_model_dir=None,    # was rec_model_dir
-            text_det_limit_side_len=1536,       # was det_limit_side_len
-            # NOTE: do NOT pass max_batch_size here
-            # If you later need batching, look at rec_batch_num/text_rec_batch_num in docs.
-        )
-    else:
-        # PaddleOCR 2.x — legacy args still valid
-        return PaddleOCR(
-            use_angle_cls=True, lang='en',
-            det_model_dir=None, rec_model_dir=None,
-            use_gpu=False,
-            ir_optim=False, enable_mkldnn=False, cpu_threads=1,
-            det_limit_side_len=1536, det_db_score_mode='fast',
-            max_batch_size=4
-        )
-
 
 # ───────────────────────── UDP trigger bridge ─────────────────────────
 
@@ -117,8 +65,7 @@ class QtTriggerListener:
             pass
 
     def _loop(self):
-        if self._sock is None:
-            return
+        if self._sock is None: return
         while not self._stop.is_set():
             try:
                 data, addr = self._sock.recvfrom(4096)
@@ -147,35 +94,16 @@ class QtTriggerListener:
                 except Exception:
                     pass
                 self.bridge.triggerReceived.emit()
-                
-class VGRResultPublisher:
-    def __init__(self, host: str = "127.0.0.1", port: int = 40003):
-        self._host = host
-        self._port = int(port)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    def set_target(self, host: str, port: int):
-        self._host = host.strip(); self._port = int(port)
-
-    def send_json(self, payload: dict):
-        try:
-            msg = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            self._sock.sendto(msg, (self._host, self._port))
-        except Exception as e:
-            print(f"[VGR-PUB] UDP send error: {e}", flush=True)
-
-# ───────────────────────── UDP publisher to robot ─────────────────────────
+# ───────────────────────── UDP publishers ─────────────────────────
 
 class RobotUDPPublisher:
     def __init__(self, host: str = "127.0.0.1", port: int = 40001):
         self._host = host
         self._port = int(port)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
     def set_target(self, host: str, port: int):
-        self._host = host.strip()
-        self._port = int(port)
-
+        self._host = host.strip(); self._port = int(port)
     def send_json(self, payload: dict):
         try:
             msg = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -183,12 +111,24 @@ class RobotUDPPublisher:
         except Exception as e:
             print(f"[PUB] UDP send error: {e}", flush=True)
 
-# ───────────────────────── VideoLabel (aspect + ROI rectangle) ─────────────────────────
+class VGRResultPublisher:
+    def __init__(self, host: str = "127.0.0.1", port: int = 40003):
+        self._host = host
+        self._port = int(port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def set_target(self, host: str, port: int):
+        self._host = host.strip(); self._port = int(port)
+    def send_json(self, payload: dict):
+        try:
+            msg = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self._sock.sendto(msg, (self._host, self._port))
+        except Exception as e:
+            print(f"[VGR-PUB] UDP send error: {e}", flush=True)
+
+# ───────────────────────── VideoLabel (aspect + ROI) ─────────────────────────
 
 class VideoLabel(QtWidgets.QLabel):
-    """Keeps aspect, draws scaled pixmap, and supports rectangular ROI selection."""
     roiSelected = QtCore.pyqtSignal(QtCore.QRect)  # rectangle in display coords
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last_draw_rect = QtCore.QRect()
@@ -197,33 +137,21 @@ class VideoLabel(QtWidgets.QLabel):
         self._origin = QtCore.QPoint()
         self._rubber = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self)
         self.setMouseTracking(True)
-
-    def setFrameSize(self, wh: Tuple[int, int]):
-        self._frame_wh = (int(wh[0]), int(wh[1]))
-
+    def setFrameSize(self, wh: Tuple[int, int]): self._frame_wh = (int(wh[0]), int(wh[1]))
     def setPixmapKeepAspect(self, pm: QtGui.QPixmap):
         if pm.isNull():
-            super().setPixmap(pm)
-            self._last_draw_rect = QtCore.QRect()
-            return
+            super().setPixmap(pm); self._last_draw_rect = QtCore.QRect(); return
         area = self.size()
         scaled = pm.scaled(area, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         x = (area.width() - scaled.width()) // 2
         y = (area.height() - scaled.height()) // 2
         self._last_draw_rect = QtCore.QRect(x, y, scaled.width(), scaled.height())
-
-        canvas = QtGui.QPixmap(area)
-        canvas.fill(QtCore.Qt.black)
-        p = QtGui.QPainter(canvas)
-        p.drawPixmap(self._last_draw_rect, scaled)
-        p.end()
+        canvas = QtGui.QPixmap(area); canvas.fill(QtCore.Qt.black)
+        p = QtGui.QPainter(canvas); p.drawPixmap(self._last_draw_rect, scaled); p.end()
         super().setPixmap(canvas)
-
     def enable_rect_selection(self, ok: bool):
         self._rect_mode = bool(ok)
-        if not ok:
-            self._rubber.hide()
-
+        if not ok: self._rubber.hide()
     def mousePressEvent(self, ev: QtGui.QMouseEvent):
         if self._rect_mode and ev.button() == QtCore.Qt.LeftButton and self._last_draw_rect.contains(ev.pos()):
             self._origin = ev.pos()
@@ -231,24 +159,20 @@ class VideoLabel(QtWidgets.QLabel):
             self._rubber.show()
         else:
             super().mousePressEvent(ev)
-
     def mouseMoveEvent(self, ev: QtGui.QMouseEvent):
         if self._rect_mode and not self._origin.isNull():
             self._rubber.setGeometry(QtCore.QRect(self._origin, ev.pos()).normalized())
         else:
             super().mouseMoveEvent(ev)
-
     def mouseReleaseEvent(self, ev: QtGui.QMouseEvent):
         if self._rect_mode and ev.button() == QtCore.Qt.LeftButton:
             r = self._rubber.geometry().intersected(self._last_draw_rect)
-            self._rubber.hide()
-            self._rect_mode = False
-            if r.width() > 5 and r.height() > 5:
-                self.roiSelected.emit(r)
+            self._rubber.hide(); self._rect_mode = False
+            if r.width() > 5 and r.height() > 5: self.roiSelected.emit(r)
             return
         super().mouseReleaseEvent(ev)
 
-# ───────────────────────── Camera Panel (external or local minimal) ─────────────────────────
+# ───────────────────────── Camera Panel (reuse your local stub if ext missing) ─────────────────────────
 
 try:
     from ui.camera_panel import CameraPanel as _ExtCameraPanel
@@ -292,7 +216,7 @@ class _LocalCameraPanel(QtWidgets.QWidget):
             grid.addWidget(QtWidgets.QLabel(lab), r,0); grid.addWidget(w, r,1); r+=1
         self.chk_flip_h = QtWidgets.QCheckBox("Flip H"); self.chk_flip_v = QtWidgets.QCheckBox("Flip V"); self.btn_rot = QtWidgets.QPushButton("Rotate 90°")
         hv = QtWidgets.QHBoxLayout(); hv.addWidget(self.chk_flip_h); hv.addWidget(self.chk_flip_v); hv.addWidget(self.btn_rot); hv.addStretch(1)
-        grid.addWidget(QtWidgets.QLabel("View"), r,0); grid.addLayout(hv, r,1); r+=1
+        grid.addLayout(hv, r,1); grid.addWidget(QtWidgets.QLabel("View"), r,0); r+=1
         self.btn_reset = QtWidgets.QPushButton("Reset tuning"); grid.addWidget(self.btn_reset, r,0,1,2); r+=1
         for w in [self.chk_ae, self.sp_exp, self.dsb_gain, self.dsb_fps, self.cmb_awb, self.dsb_awb_r, self.dsb_awb_b,
                   self.cmb_af, self.dsb_dioptre, self.dsb_bri, self.dsb_con, self.dsb_sat, self.dsb_sha, self.cmb_den]:
@@ -357,7 +281,7 @@ def make_camera_panel():
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RPi Vision Client – Canny Contour")
+        self.setWindowTitle("RPi Vision Client – Blob Inspection")
         self.resize(1600, 980)
 
         # websocket
@@ -373,7 +297,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fps_acc = 0.0
         self._fps_n = 0
         self._last_ts = time.perf_counter()
-        self._settings = QtCore.QSettings('vision_sdk', 'ui_canny_contour')
+        self._settings = QtCore.QSettings('vision_sdk', 'ui_blob')
         self._log_buffer: List[str] = []
 
         self._last_frame_bgr: Optional[np.ndarray] = None
@@ -382,11 +306,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._expect_one_result = False
         self._last_result_time = 0.0
-
-        # Template library
-        # item = {"name": str, "area": float, "perim": float, "contour": ndarray Nx1x2 (int)}
-        self._templates: List[Dict[str, Any]] = []
-        self._active_index: int = -1
 
         # central: left controls + video + right panels
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -411,12 +330,14 @@ class MainWindow(QtWidgets.QMainWindow):
         cf.addRow("Robot Port:", self.sp_robot_port)
         cf.addRow("", self.chk_pub_robot)
         left_v.addWidget(conn_box)
+
+        # VGR Result target
         self.ed_vgr_ip   = QtWidgets.QLineEdit(self.ed_robot_ip.text())
         self.sp_vgr_port = QtWidgets.QSpinBox(); self.sp_vgr_port.setRange(1,65535); self.sp_vgr_port.setValue(40003)
         cf.addRow("VGR Result IP:", self.ed_vgr_ip)
         cf.addRow("VGR Result Port:", self.sp_vgr_port)
 
-        # UDP publisher binding
+        # UDP publishers
         self.pub_robot = RobotUDPPublisher(self.ed_robot_ip.text(), int(self.sp_robot_port.value()))
         self.ed_robot_ip.textChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
         self.sp_robot_port.valueChanged.connect(lambda *_: self.pub_robot.set_target(self.ed_robot_ip.text(), self.sp_robot_port.value()))
@@ -445,72 +366,85 @@ class MainWindow(QtWidgets.QMainWindow):
         pf.addRow("Run every Nth", self.sp_every)
         left_v.addWidget(proc_box)
 
-        # Canny pipeline parameters
-        canny_box = QtWidgets.QGroupBox("Canny Pipeline")
-        cf2 = QtWidgets.QFormLayout(canny_box)
+        # Blob pipeline parameters
+        blob_box = QtWidgets.QGroupBox("Blob Pipeline")
+        bf = QtWidgets.QFormLayout(blob_box)
 
         # Preprocess
         self.chk_clahe = QtWidgets.QCheckBox("CLAHE"); self.chk_clahe.setChecked(False)
         self.ds_clip = QtWidgets.QDoubleSpinBox(); self.ds_clip.setRange(0.5, 10.0); self.ds_clip.setDecimals(2); self.ds_clip.setValue(2.0)
         self.sp_tiles = QtWidgets.QSpinBox(); self.sp_tiles.setRange(2, 16); self.sp_tiles.setValue(8)
         self.sp_blur = QtWidgets.QSpinBox(); self.sp_blur.setRange(0, 21); self.sp_blur.setSingleStep(2); self.sp_blur.setValue(5)  # 0 = off, odd only
-        cf2.addRow("CLAHE", self._hbox(self.chk_clahe, QtWidgets.QLabel("clip"), self.ds_clip, QtWidgets.QLabel("tiles"), self.sp_tiles))
-        cf2.addRow("Gaussian Blur (ksize odd, 0=off)", self.sp_blur)
+        bf.addRow("CLAHE", self._hbox(self.chk_clahe, QtWidgets.QLabel("clip"), self.ds_clip, QtWidgets.QLabel("tiles"), self.sp_tiles))
+        bf.addRow("Gaussian Blur (ksize odd, 0=off)", self.sp_blur)
 
-        # Canny core
-        self.sp_canny_lo = QtWidgets.QSpinBox(); self.sp_canny_lo.setRange(0,255); self.sp_canny_lo.setValue(50)
-        self.sp_canny_hi = QtWidgets.QSpinBox(); self.sp_canny_hi.setRange(1,255); self.sp_canny_hi.setValue(150)
-        self.cmb_canny_ap = QtWidgets.QComboBox(); self.cmb_canny_ap.addItems(["3","5","7"])
-        self.chk_l2 = QtWidgets.QCheckBox("L2 gradient"); self.chk_l2.setChecked(True)
-        cf2.addRow("Canny lo/hi", self._hbox(self.sp_canny_lo, self.sp_canny_hi))
-        cf2.addRow("Aperture", self.cmb_canny_ap)
-        cf2.addRow("", self.chk_l2)
+        # Thresholding
+        self.cmb_thr_mode = QtWidgets.QComboBox(); self.cmb_thr_mode.addItems(["Otsu","Fixed","AdaptiveMean","AdaptiveGaussian"])
+        self.sp_thr_val = QtWidgets.QSpinBox(); self.sp_thr_val.setRange(0,255); self.sp_thr_val.setValue(128)
+        self.cmb_polarity = QtWidgets.QComboBox(); self.cmb_polarity.addItems(["DarkOnLight","LightOnDark"])
+        bf.addRow("Threshold mode / value", self._hbox(self.cmb_thr_mode, self.sp_thr_val))
+        bf.addRow("Polarity", self.cmb_polarity)
 
-        # Post edge
-        self.sp_dilate = QtWidgets.QSpinBox(); self.sp_dilate.setRange(0, 10); self.sp_dilate.setValue(1)
-        cf2.addRow("Edge dilate (iter)", self.sp_dilate)
+        # Morphology
+        self.sp_open = QtWidgets.QSpinBox(); self.sp_open.setRange(0,10); self.sp_open.setValue(1)
+        self.sp_close = QtWidgets.QSpinBox(); self.sp_close.setRange(0,10); self.sp_close.setValue(1)
+        bf.addRow("Open iters / Close iters", self._hbox(self.sp_open, self.sp_close))
 
-        left_v.addWidget(canny_box)
+        left_v.addWidget(blob_box)
 
-        # Contour filters
-        filt_box = QtWidgets.QGroupBox("Contour Filters")
+        # Blob filters + selection
+        filt_box = QtWidgets.QGroupBox("Blob Filters & Selection")
         ff = QtWidgets.QFormLayout(filt_box)
-        self.sp_min_area = QtWidgets.QSpinBox(); self.sp_min_area.setRange(0, 1_000_000); self.sp_min_area.setValue(200)
+        self.sp_min_area = QtWidgets.QSpinBox(); self.sp_min_area.setRange(0, 10_000_000); self.sp_min_area.setValue(300)
         self.sp_max_area = QtWidgets.QSpinBox(); self.sp_max_area.setRange(0, 10_000_000); self.sp_max_area.setValue(0)  # 0 = no limit
         self.ds_aspect_min = QtWidgets.QDoubleSpinBox(); self.ds_aspect_min.setRange(0.0, 100.0); self.ds_aspect_min.setDecimals(2); self.ds_aspect_min.setValue(0.0)
         self.ds_aspect_max = QtWidgets.QDoubleSpinBox(); self.ds_aspect_max.setRange(0.0, 100.0); self.ds_aspect_max.setDecimals(2); self.ds_aspect_max.setValue(100.0)
         self.ds_solidity_min = QtWidgets.QDoubleSpinBox(); self.ds_solidity_min.setRange(0.0, 1.0); self.ds_solidity_min.setDecimals(2); self.ds_solidity_min.setValue(0.0)
-        self.ds_perim_min = QtWidgets.QDoubleSpinBox(); self.ds_perim_min.setRange(0.0, 100000.0); self.ds_perim_min.setDecimals(1); self.ds_perim_min.setValue(0.0)
-        self.sp_keepN = QtWidgets.QSpinBox(); self.sp_keepN.setRange(1, 200); self.sp_keepN.setValue(50)
+        self.ds_circ_min = QtWidgets.QDoubleSpinBox(); self.ds_circ_min.setRange(0.0, 1.0); self.ds_circ_min.setDecimals(3); self.ds_circ_min.setValue(0.0)  # 1.0 = perfect circle
+        self.sp_holes_min = QtWidgets.QSpinBox(); self.sp_holes_min.setRange(0, 200); self.sp_holes_min.setValue(0)
+        self.sp_holes_max = QtWidgets.QSpinBox(); self.sp_holes_max.setRange(0, 200); self.sp_holes_max.setValue(100)
+        self.sp_keepN = QtWidgets.QSpinBox(); self.sp_keepN.setRange(1, 500); self.sp_keepN.setValue(50)
+        self.rad_pick_largest = QtWidgets.QRadioButton("Pick Largest")
+        self.rad_pick_best = QtWidgets.QRadioButton("Pick Best by Score (circularity * solidity * area)")
+        self.rad_pick_largest.setChecked(True)
         ff.addRow("Min / Max area", self._hbox(self.sp_min_area, self.sp_max_area))
         ff.addRow("Aspect min/max", self._hbox(self.ds_aspect_min, self.ds_aspect_max))
         ff.addRow("Solidity ≥", self.ds_solidity_min)
-        ff.addRow("Perimeter ≥", self.ds_perim_min)
+        ff.addRow("Circularity ≥", self.ds_circ_min)
+        ff.addRow("Holes min/max", self._hbox(self.sp_holes_min, self.sp_holes_max))
         ff.addRow("Keep top N (by area)", self.sp_keepN)
+        ff.addRow(self.rad_pick_largest)
+        ff.addRow(self.rad_pick_best)
         left_v.addWidget(filt_box)
 
-        # Template library + matching
-        lib_box = QtWidgets.QGroupBox("Template Library & Matching")
-        lf = QtWidgets.QFormLayout(lib_box)
-        self.lst_tpl = QtWidgets.QListWidget()
-        self.btn_teach = QtWidgets.QPushButton("Teach from ROI…")
-        self.btn_add_name = QtWidgets.QPushButton("Rename…")
-        self.btn_delete = QtWidgets.QPushButton("Delete")
-        self.btn_save_lib = QtWidgets.QPushButton("Save Library…")
-        self.btn_load_lib = QtWidgets.QPushButton("Load Library…")
-        libbtns = self._hbox(self.btn_teach, self.btn_add_name, self.btn_delete, self.btn_save_lib, self.btn_load_lib)
-        self.cmb_metric = QtWidgets.QComboBox(); self.cmb_metric.addItems(["I1","I2","I3"])
-        self.ds_match_thr = QtWidgets.QDoubleSpinBox(); self.ds_match_thr.setRange(0.0, 10.0); self.ds_match_thr.setDecimals(4); self.ds_match_thr.setValue(0.10)
-        self.sp_area_tol = QtWidgets.QSpinBox(); self.sp_area_tol.setRange(0, 200); self.sp_area_tol.setValue(25)   # ±%
-        self.sp_perim_tol = QtWidgets.QSpinBox(); self.sp_perim_tol.setRange(0, 200); self.sp_perim_tol.setValue(20) # ±%
-        self.chk_require_active = QtWidgets.QCheckBox("Require active template for GO"); self.chk_require_active.setChecked(False)
+        # Optional intensity gate
+        int_box = QtWidgets.QGroupBox("Optional Intensity Gate (mean gray inside blob)")
+        inf = QtWidgets.QFormLayout(int_box)
+        self.chk_int_gate = QtWidgets.QCheckBox("Enable intensity range")
+        self.sp_int_min = QtWidgets.QSpinBox(); self.sp_int_min.setRange(0,255); self.sp_int_min.setValue(0)
+        self.sp_int_max = QtWidgets.QSpinBox(); self.sp_int_max.setRange(0,255); self.sp_int_max.setValue(255)
+        inf.addRow(self.chk_int_gate)
+        inf.addRow("Min / Max", self._hbox(self.sp_int_min, self.sp_int_max))
+        left_v.addWidget(int_box)
+        
+        # GO/NOGO by count + holes
+        rule_box = QtWidgets.QGroupBox("Decision by Count")
+        rv = QtWidgets.QFormLayout(rule_box)
 
-        lf.addRow(self.lst_tpl)
-        lf.addRow(libbtns)
-        lf.addRow("Match metric / thr", self._hbox(self.cmb_metric, self.ds_match_thr))
-        lf.addRow("Area ±% / Perim ±%", self._hbox(self.sp_area_tol, self.sp_perim_tol))
-        lf.addRow("", self.chk_require_active)
-        left_v.addWidget(lib_box)
+        self.sp_expected_count = QtWidgets.QSpinBox(); self.sp_expected_count.setRange(0, 999); self.sp_expected_count.setValue(1)
+        self.sp_expected_holes = QtWidgets.QSpinBox(); self.sp_expected_holes.setRange(0, 999); self.sp_expected_holes.setValue(0)
+
+        self.lbl_count_hint = QtWidgets.QLabel("GO if (detected blobs == expected) AND (holes == expected)")
+        self.chk_at_least = QtWidgets.QCheckBox("Use ≥ expected blobs (instead of ==)")
+        self.chk_holes_at_least = QtWidgets.QCheckBox("Use ≥ expected holes (instead of ==)")
+
+        rv.addRow("Expected blobs", self.sp_expected_count)
+        rv.addRow("Expected holes (primary blob)", self.sp_expected_holes)
+        rv.addRow(self.lbl_count_hint)
+        rv.addRow(self.chk_at_least)
+        rv.addRow(self.chk_holes_at_least)
+
+        left_v.addWidget(rule_box)
 
         # Draw options
         draw_box = QtWidgets.QGroupBox("Draw Options")
@@ -518,7 +452,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_draw_cnt = QtWidgets.QCheckBox("Contours"); self.chk_draw_cnt.setChecked(True)
         self.chk_draw_box = QtWidgets.QCheckBox("Boxes"); self.chk_draw_box.setChecked(True)
         self.chk_draw_cent = QtWidgets.QCheckBox("Centroids"); self.chk_draw_cent.setChecked(False)
-        self.chk_draw_ids = QtWidgets.QCheckBox("IDs / Scores"); self.chk_draw_ids.setChecked(True)
+        self.chk_draw_ids = QtWidgets.QCheckBox("IDs / Metrics"); self.chk_draw_ids.setChecked(True)
         dv.addWidget(self.chk_draw_cnt); dv.addWidget(self.chk_draw_box); dv.addWidget(self.chk_draw_cent); dv.addWidget(self.chk_draw_ids)
         left_v.addWidget(draw_box)
 
@@ -531,26 +465,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_clear.clicked.connect(lambda: self._show_image(self._last_frame_bgr))
         ah.addWidget(self.btn_once); ah.addWidget(self.btn_clear); ah.addStretch(1)
         left_v.addWidget(act_box)
-        
-        # OCR (GO/NOGO) – minimal controls
-        ocr_box = QtWidgets.QGroupBox("OCR (drives GO/NOGO)")
-        of = QtWidgets.QFormLayout(ocr_box)
-        self.ed_ocr_target = QtWidgets.QLineEdit()
-        self.ed_ocr_target.setPlaceholderText("e.g. LOT123, OK, 24-09, ...")
-        self.cb_ocr_match = QtWidgets.QComboBox(); self.cb_ocr_match.addItems(["contains","exact","startswith","regex"])
-        self.chk_ocr_case = QtWidgets.QCheckBox("Case sensitive")
-        self.ds_ocr_minconf = QtWidgets.QDoubleSpinBox(); self.ds_ocr_minconf.setRange(0.0,1.0); self.ds_ocr_minconf.setSingleStep(0.05); self.ds_ocr_minconf.setValue(0.50)
-        self.chk_ocr_pre = QtWidgets.QCheckBox("Preprocess (CLAHE + denoise + upscale)"); self.chk_ocr_pre.setChecked(True)
-        self.chk_use_ocr = QtWidgets.QCheckBox("Use OCR for GO/NOGO"); self.chk_use_ocr.setChecked(True)
-        of.addRow("Target", self.ed_ocr_target)
-        of.addRow("Match", self.cb_ocr_match)
-        of.addRow(self.chk_ocr_case)
-        of.addRow("Min Conf", self.ds_ocr_minconf)
-        of.addRow(self.chk_ocr_pre)
-        of.addRow(self.chk_use_ocr)
-        left_v.addWidget(ocr_box)
+
         left_v.addStretch(1)
-        
+
         # Left scroll
         self.controlsPanel = QtWidgets.QScrollArea(); self.controlsPanel.setWidgetResizable(True)
         self.controlsPanel.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -565,10 +482,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # RIGHT: results + log
         right = QtWidgets.QVBoxLayout()
-        grp = QtWidgets.QGroupBox("Contours (last run)")
+        grp = QtWidgets.QGroupBox("Blobs (last run)")
         vv = QtWidgets.QVBoxLayout(grp)
-        self.tbl = QtWidgets.QTableWidget(0, 9)
-        self.tbl.setHorizontalHeaderLabels(["id","area","perim","x","y","w","h","solidity","match"])
+        self.tbl = QtWidgets.QTableWidget(0, 12)
+        self.tbl.setHorizontalHeaderLabels(["id","area","perim","x","y","w","h","sol","circ","aspect","holes","meanI"])
         self.tbl.horizontalHeader().setStretchLastSection(True)
         vv.addWidget(self.tbl)
         right.addWidget(grp, 1)
@@ -616,15 +533,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cam_panel.viewChanged.connect(lambda v: self._send({"type": "set_view", **v}))
         if hasattr(self.cam_panel, "afTriggerRequested"):
             self.cam_panel.afTriggerRequested.connect(lambda: self._send({"type": "af_trigger"}))
-
-        # teach ROI + library ops
-        self.btn_teach.clicked.connect(self._start_teach_roi)
-        self.video.roiSelected.connect(self._finish_teach_roi)
-        self.lst_tpl.currentRowChanged.connect(self._on_tpl_selected)
-        self.btn_add_name.clicked.connect(self._rename_template)
-        self.btn_delete.clicked.connect(self._delete_template)
-        self.btn_save_lib.clicked.connect(self._save_library)
-        self.btn_load_lib.clicked.connect(self._load_library)
 
         self._ping = QtCore.QTimer(interval=10000, timeout=lambda: self._send({"type": "ping"}))
         self._load_settings()
@@ -750,321 +658,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video.setPixmapKeepAspect(pm)
 
     def _show_image(self, bgr: Optional[np.ndarray]):
-        if bgr is None:
-            return
+        if bgr is None: return
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         qi = QtGui.QImage(rgb.data, w, h, rgb.strides[0], QtGui.QImage.Format_RGB888).copy()
         self._set_pixmap(qi)
 
-    # ───────────────────────── teaching via ROI ─────────────────────────
-
-    def _start_teach_roi(self):
-        if self._last_frame_bgr is None:
-            self.status.showMessage("No frame to teach from", 2000)
-            return
-        self.status.showMessage("Drag ROI on the image…", 2000)
-        self.video.enable_rect_selection(True)
-
-    def _finish_teach_roi(self, rect_disp: QtCore.QRect):
-        if self._last_frame_bgr is None: return
-        draw = self.video._last_draw_rect
-        if draw.isNull() or self.last_frame_wh == (0, 0): return
-
-        fw, fh = self.last_frame_wh
-        sx = fw / float(draw.width())
-        sy = fh / float(draw.height())
-        x0 = int((rect_disp.x() - draw.x()) * sx)
-        y0 = int((rect_disp.y() - draw.y()) * sy)
-        x1 = int((rect_disp.right() - draw.x()) * sx)
-        y1 = int((rect_disp.bottom() - draw.y()) * sy)
-        x0 = max(0, min(fw-1, x0)); x1 = max(0, min(fw-1, x1))
-        y0 = max(0, min(fh-1, y0)); y1 = max(0, min(fh-1, y1))
-        if x1 <= x0 or y1 <= y0:
-            self.status.showMessage("ROI too small", 2000); return
-
-        roi = self._last_frame_bgr[y0:y1+1, x0:x1+1].copy()
-        vis, dets = self._compute_contours(roi, offset=(x0, y0))
-
-        if not dets:
-            self._append_log("Teach: no contour in ROI")
-            self.status.showMessage("Teach failed: no contour", 2500)
-            return
-
-        # choose largest area detection as template
-        best = dets[0]
-        # Build a horizontally mirrored version of the taught contour (around its centroid)
-        c = best["contour"].astype(np.float32)
-        M = cv2.moments(c)
-        if M["m00"] > 1e-6:
-            cx = M["m10"] / M["m00"]; cy = M["m01"] / M["m00"]
-        else:
-            # fallback if contour is degenerate
-            xs = c[:,:,0]; ys = c[:,:,1]
-            cx = float(xs.mean()); cy = float(ys.mean())
-
-        cm = c.copy()
-        cm[:,:,0] -= cx; cm[:,:,1] -= cy
-        cm[:,:,0] *= -1.0                      # mirror X
-        cm[:,:,0] += cx; cm[:,:,1] += cy
-        contour_mirror = cm.astype(np.int32)
-
-        name, ok = QtWidgets.QInputDialog.getText(self, "Template name", "Enter name:")
-        if not ok or not name: name = f"tpl_{len(self._templates)+1}"
-
-        tpl = dict(
-            name=str(name),
-            area=float(best["area"]),
-            perim=float(best["perim"]),
-            contour=best["contour"],           # original
-            contour_mirror=contour_mirror      # <- add this
-        )
-
-        self._templates.append(tpl)
-        self._refresh_tpl_list(select_last=True)
-        self._append_log(f"Teach ok: '{name}' area={int(tpl['area'])} perim={tpl['perim']:.1f} bbox={best['bbox']}")
-
-        overlay = self._last_frame_bgr.copy()
-        x,y,w,h = best["bbox"]
-        cv2.rectangle(overlay, (x,y), (x+w,y+h), (0,255,255), 2)
-        cv2.rectangle(overlay, (x0,y0), (x1,y1), (255,0,0), 2)
-        try:
-            jpeg = cv2.imencode(".jpg", overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 85])[1].tobytes()
-            qi = QtGui.QImage.fromData(jpeg, "JPG")
-            self._last_overlay = qi
-            self._overlay_until = time.time() + 1.5
-            self._set_pixmap(qi)
-        except Exception:
-            pass
-
-    def _refresh_tpl_list(self, select_last=False):
-        self.lst_tpl.blockSignals(True)
-        self.lst_tpl.clear()
-        for t in self._templates:
-            self.lst_tpl.addItem(f"{t['name']}  (A={int(t['area'])}, P={t['perim']:.1f})")
-        if select_last and self._templates:
-            self.lst_tpl.setCurrentRow(len(self._templates)-1)
-        self.lst_tpl.blockSignals(False)
-        self._active_index = self.lst_tpl.currentRow()
-
-    def _on_tpl_selected(self, row: int):
-        self._active_index = int(row) if row is not None else -1
-
-    def _rename_template(self):
-        i = self._active_index
-        if 0 <= i < len(self._templates):
-            cur = self._templates[i]["name"]
-            name, ok = QtWidgets.QInputDialog.getText(self, "Rename template", "New name:", text=cur)
-            if ok and name:
-                self._templates[i]["name"] = name
-                self._refresh_tpl_list()
-                self.lst_tpl.setCurrentRow(i)
-
-    def _delete_template(self):
-        i = self._active_index
-        if 0 <= i < len(self._templates):
-            del self._templates[i]
-            self._refresh_tpl_list()
-            self._active_index = self.lst_tpl.currentRow()
-
-    def _save_library(self):
-        fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Template Library", "canny_templates.json", "JSON (*.json)")
-        if not fn: return
-        try:
-            out = []
-            for t in self._templates:
-                c = t["contour"].astype(int).tolist()
-                out.append({"name": t["name"], "area": t["area"], "perim": t["perim"], "contour": c})
-            with open(fn, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=2)
-            self._append_log(f"Saved {len(out)} templates to {fn}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save error", str(e))
-
-    def _load_library(self):
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Template Library", ".", "JSON (*.json)")
-        if not fn: return
-        try:
-            with open(fn, "r", encoding="utf-8") as f:
-                arr = json.load(f)
-            self._templates = []
-            for t in arr:
-                c = np.array(t["contour"], dtype=np.int32)
-                c_f = c.astype(np.float32)
-                M = cv2.moments(c_f)
-                if M["m00"] > 1e-6:
-                    cx = M["m10"] / M["m00"]; cy = M["m01"] / M["m00"]
-                else:
-                    xs = c_f[:,:,0]; ys = c_f[:,:,1]
-                    cx = float(xs.mean()); cy = float(ys.mean())
-                cm = c_f.copy()
-                cm[:,:,0] -= cx; cm[:,:,1] -= cy
-                cm[:,:,0] *= -1.0
-                cm[:,:,0] += cx; cm[:,:,1] += cy
-                c_mirror = cm.astype(np.int32)
-                self._templates.append(dict(
-                    name=t["name"],
-                    area=float(t["area"]),
-                    perim=float(t["perim"]),
-                    contour=c,
-                    contour_mirror=c_mirror
-                ))
-                # self._templates.append(dict(name=t["name"], area=float(t["area"]), perim=float(t["perim"]), contour=c))
-            self._refresh_tpl_list(select_last=True)
-            self._append_log(f"Loaded {len(self._templates)} templates from {fn}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Load error", str(e))
-            
-    # ───────────────────────── OCR helpers (inline, sync) ─────────────────────────
-    def _ocr__matches(self, text: str, target: str, mode: str, case: bool) -> bool:
-        if not target: return False
-        if mode not in ("contains","exact","startswith","regex"): mode = "contains"
-        a = text if case else text.lower()
-        b = target if case else target.lower()
-        if mode == "exact": return a == b
-        if mode == "startswith": return a.startswith(b)
-        if mode == "regex":
-            import re
-            flags = 0 if case else re.IGNORECASE
-            try: return re.search(target, text, flags) is not None
-            except re.error: return False
-        return b in a  # contains
-
-    def _ocr__preprocess(self, img_bgr: np.ndarray) -> np.ndarray:
-        # same spirit as your ocr_worker
-        import cv2
-        h, w = img_bgr.shape[:2]
-        if max(h, w) < 1200:
-            s = 1200.0 / max(h, w)
-            img_bgr = cv2.resize(img_bgr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
-        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-        L, A, B = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        L = clahe.apply(L)
-        lab = cv2.merge([L, A, B])
-        img_bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-        img_bgr = cv2.bilateralFilter(img_bgr, d=5, sigmaColor=40, sigmaSpace=40)
-        return img_bgr
-
-    def _ocr__run(self, bgr: np.ndarray, do_pre: bool, min_conf: float) -> dict:
-        """
-        Returns: {"detections":[{"text","confidence","bbox"}], "infer_ms": float}
-        bbox = 4x2 polygon in full-frame pixel coords
-        """
-        import time, cv2
-        import numpy as _np
-        from PIL import Image
-
-        if bgr is None: return {"detections":[], "infer_ms":0.0}
-        img = bgr.copy()
-        if do_pre: img = self._ocr__preprocess(img)
-
-        # modest upscaling if still small
-        h0, w0 = img.shape[:2]
-        scale = 1.0
-        if max(h0, w0) < 1000:
-            scale = 1000.0 / max(h0, w0)
-            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-        engine = getattr(self, "_paddle_engine", None)
-        if engine is None:
-            engine = _lazy_paddleocr()
-            self._paddle_engine = engine  # cache across triggers
-
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        t0 = time.time()
-        try:
-            # PaddleOCR 3.x prefers predict(img), 2.x used ocr(img, cls=True)
-            if hasattr(engine, "predict"):
-                result = engine.predict(_np.array(Image.fromarray(rgb)))
-            else:
-                result = engine.ocr(_np.array(Image.fromarray(rgb)), cls=True)
-        except Exception as e:
-            # same safe retry pattern as before
-            if any(k in str(e).lower() for k in ("primitive","onednn","fused_conv2d")):
-                engine = _lazy_paddleocr()
-                self._paddle_engine = engine
-                if hasattr(engine, "predict"):
-                    result = engine.predict(_np.array(Image.fromarray(rgb)))
-                else:
-                    result = engine.ocr(_np.array(Image.fromarray(rgb)), cls=True)
-            else:
-                raise
-        infer_ms = (time.time() - t0) * 1000.0
-
-        dets = []
-        inv_s = 1.0 / scale
-
-        def _emit(poly, text, score):
-            if float(score) < float(min_conf): 
-                return
-            box = _np.array(poly, dtype=_np.float32)
-            if box.ndim == 3:  # Nx1x2 -> Nx2
-                box = box[:,0,:]
-            if scale != 1.0:
-                box[:,0] *= inv_s; box[:,1] *= inv_s
-            dets.append({"text": str(text), "confidence": float(score), "bbox": box.tolist()})
-
-        # ---------- Parse both 2.x and 3.x shapes ----------
-        if result:
-            # 2.x shape: [ [ [poly, (text, score)], ... ] ]
-            if isinstance(result, list) and result and isinstance(result[0], list):
-                for res in result:
-                    for line in res or []:
-                        try:
-                            poly, (txt, sc) = line
-                            _emit(poly, txt, sc)
-                        except Exception:
-                            continue
-            else:
-                # 3.x common shapes:
-                # a) dict with keys like: 'polys'/'boxes' + 'rec_texts' + 'rec_scores'
-                # b) dict with 'results': list of {'polygon'|'box'|'bbox', 'text', 'score'}
-                blocks = result if isinstance(result, list) else [result]
-                for blk in blocks:
-                    if not isinstance(blk, dict):
-                        continue
-                    # b)
-                    if "results" in blk and isinstance(blk["results"], list):
-                        for r in blk["results"]:
-                            poly = r.get("polygon") or r.get("poly") or r.get("box") or r.get("bbox")
-                            txt  = r.get("text", "")
-                            sc   = r.get("score", 0.0)
-                            if poly is not None: _emit(poly, txt, sc)
-                        continue
-                    # a)
-                    polys = blk.get("polys") or blk.get("boxes") or blk.get("det_polys") or blk.get("det_boxes")
-                    texts = blk.get("rec_texts") or blk.get("texts") or blk.get("rec_text")
-                    scores = blk.get("rec_scores") or blk.get("scores") or blk.get("rec_score")
-                    if isinstance(polys, list) and isinstance(texts, list):
-                        n = min(len(polys), len(texts), len(scores) if isinstance(scores, list) else len(texts))
-                        for i in range(n):
-                            _emit(polys[i], texts[i], (scores[i] if isinstance(scores, list) else 1.0))
-
-        return {"detections": dets, "infer_ms": round(infer_ms, 1)}
-
-    def _ocr__decide_go_nogo(self, bgr: np.ndarray) -> tuple[str, float, dict]:
-        """
-        Returns (name, best_conf, ocr_result)
-        name ∈ {"go","nogo"}, best_conf in [0,1] (0 if none), raw result dict.
-        """
-        if not bool(self.chk_use_ocr.isChecked()):
-            return ("nogo", 0.0, {"detections":[], "infer_ms":0.0})
-        target = self.ed_ocr_target.text().strip()
-        mode   = self.cb_ocr_match.currentText()
-        case   = bool(self.chk_ocr_case.isChecked())
-        min_c  = float(self.ds_ocr_minconf.value())
-        pre    = bool(self.chk_ocr_pre.isChecked())
-
-        res = self._ocr__run(bgr, pre, min_c)
-        best = 0.0
-        for d in res["detections"]:
-            if self._ocr__matches(d.get("text",""), target, mode, case):
-                best = max(best, float(d.get("confidence",0.0)))
-        return ("go" if best > 0.0 else "nogo", best, res)
-
-    # ───────────────────────── contour pipeline ─────────────────────────
+    # ───────────────────────── actions ─────────────────────────
 
     def _run_once(self):
         self._process_and_update(publish=True)
@@ -1073,38 +673,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.rad_trig.isChecked():
             self.rad_trig.setChecked(True)  # emits set_mode
         self._send({"type": "trigger"})
-        self._append_log("TRIGGER pressed → OCR-driven GO/NOGO from current frame")
-        self._trigger_publish_once()
-
-    def _on_udp_trigger(self):
-        if not self.rad_trig.isChecked():
-            self.rad_trig.setChecked(True)  # emits set_mode
-        self._append_log("UDP TRIGGER → OCR-driven GO/NOGO from current frame")
-        self._send({"type": "trigger"})
-        self._trigger_publish_once()
-
-    def _trigger_publish_once(self):
+        self._append_log("TRIGGER pressed → sending VGR result NOW from current frame")
         if self._last_frame_bgr is not None:
-            vis, dets = self._compute_contours(self._last_frame_bgr)
-            # OCR decision (full-frame) → name = "go"/"nogo"
-            name, ocr_conf, ocr_res = self._ocr__decide_go_nogo(self._last_frame_bgr)
-            self._append_log(f"[OCR] detections={len(ocr_res['detections'])} best_match_conf={ocr_conf:.2f}")
+            vis, dets = self._compute_blobs(self._last_frame_bgr)
             self._show_image(vis)
-            self._publish_vgr_result(dets, forced_name=name, ocr_score=ocr_conf)
+            self.status.showMessage(f"Detected blobs: {len(dets)}   (expected {int(self.sp_expected_count.value())})", 1500)
+            self._publish_vgr_result(dets)
             self._last_result_time = time.time()
             self._expect_one_result = False
         else:
             self._append_log("No frame yet → will publish after next frame")
             self._expect_one_result = True
 
+    def _on_udp_trigger(self):
+        if not self.rad_trig.isChecked():
+            self.rad_trig.setChecked(True)  # emits set_mode
+        self._append_log("UDP TRIGGER → sending VGR result NOW from current frame")
+        self._send({"type": "trigger"})
+        if self._last_frame_bgr is not None:
+            vis, dets = self._compute_blobs(self._last_frame_bgr)
+            self._show_image(vis)
+            self._publish_vgr_result(dets)
+            self._last_result_time = time.time()
+            self._expect_one_result = False
+        else:
+            self._append_log("No frame yet → will publish after next frame")
+            self._expect_one_result = True
 
     def _process_and_update(self, publish: bool):
         if self._last_frame_bgr is None:
             self.status.showMessage("No frame yet", 1500)
             return
 
-        vis, dets = self._compute_contours(self._last_frame_bgr)
+        vis, dets = self._compute_blobs(self._last_frame_bgr)
         self._show_image(vis)
+        self.status.showMessage(
+            f"Detected blobs: {len(dets)} (expected {int(self.sp_expected_count.value())}) | "
+            f"Holes(primary): {dets[0]['holes_count'] if dets else 0} (expected {int(self.sp_expected_holes.value())})",
+            1500
+        )
 
         # fill table
         self.tbl.setRowCount(0)
@@ -1119,7 +726,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(int(w))))
             self.tbl.setItem(r, 6, QtWidgets.QTableWidgetItem(str(int(h))))
             self.tbl.setItem(r, 7, QtWidgets.QTableWidgetItem(f'{d["solidity"]:.2f}'))
-            self.tbl.setItem(r, 8, QtWidgets.QTableWidgetItem("-" if d.get("match") is None else f'{d["match"]:.4f}'))
+            self.tbl.setItem(r, 8, QtWidgets.QTableWidgetItem(f'{d["circularity"]:.3f}'))
+            self.tbl.setItem(r, 9, QtWidgets.QTableWidgetItem(f'{d["aspect"]:.3f}'))
+            self.tbl.setItem(r,10, QtWidgets.QTableWidgetItem(str(int(d["holes_count"]))))
+            self.tbl.setItem(r,11, QtWidgets.QTableWidgetItem(f'{d["mean_intensity"]:.1f}'))
 
         # In Trigger mode, do one-shot publish and latch result briefly
         if self.rad_trig.isChecked() and self._expect_one_result:
@@ -1129,225 +739,185 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # In Training mode, publish if desired every run
         if self.rad_train.isChecked() and publish:
-            name, ocr_conf, _ = self._ocr__decide_go_nogo(self._last_frame_bgr)
-            self._publish_vgr_result(dets, forced_name=name, ocr_score=ocr_conf)
+            self._publish_vgr_result(dets)
 
+        self._append_log(f"[COUNT] detected={len(dets)} expected={int(self.sp_expected_count.value())}")
 
-    def _canny_edges(self, gray: np.ndarray) -> np.ndarray:
-        # optional CLAHE
+    # ───────────────────────── blob pipeline ─────────────────────────
+
+    def _pre_gray(self, bgr: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         if self.chk_clahe.isChecked():
             clip = float(self.ds_clip.value())
             tiles = int(self.sp_tiles.value())
             clahe = cv2.createCLAHE(clipLimit=max(0.1, clip), tileGridSize=(tiles, tiles))
             gray = clahe.apply(gray)
-
-        # optional blur
         k = int(self.sp_blur.value())
         if k > 0 and k % 2 == 1:
             gray = cv2.GaussianBlur(gray, (k, k), 0)
+        return gray
 
-        lo = int(self.sp_canny_lo.value())
-        hi = int(self.sp_canny_hi.value())
-        ap = int(self.cmb_canny_ap.currentText())
-        l2 = bool(self.chk_l2.isChecked())
-        edges = cv2.Canny(gray, lo, hi, apertureSize=ap, L2gradient=l2)
+    def _threshold(self, gray: np.ndarray) -> np.ndarray:
+        mode = self.cmb_thr_mode.currentText()
+        pol = self.cmb_polarity.currentText()
+        invert = (pol == "LightOnDark")  # if features are bright on dark, invert post-threshold
+        if mode == "Fixed":
+            t = int(self.sp_thr_val.value())
+            _, mask = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY)
+        elif mode == "AdaptiveMean":
+            mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                         cv2.THRESH_BINARY, 21, 5)
+        elif mode == "AdaptiveGaussian":
+            mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY, 21, 5)
+        else:  # Otsu
+            _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        if invert:
+            mask = 255 - mask
+        # Morphology cleanup
+        it_open = int(self.sp_open.value())
+        it_close = int(self.sp_close.value())
+        k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+        if it_open > 0: mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=it_open)
+        if it_close > 0: mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3, iterations=it_close)
+        # Kill border 1 px to avoid giant border components
+        h, w = mask.shape[:2]
+        if h > 2 and w > 2:
+            mask[0,:] = 0; mask[h-1,:] = 0; mask[:,0] = 0; mask[:,w-1] = 0
+        return mask
 
-        # optional dilate to thicken edges (stabilize contours)
-        it = int(self.sp_dilate.value())
-        if it > 0:
-            k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-            edges = cv2.dilate(edges, k3, iterations=it)
-        return edges
-    
-    def _bbox_iou(self, a, b):
-        ax, ay, aw, ah = a["bbox"]; bx, by, bw, bh = b["bbox"]
-        x1 = max(ax, bx); y1 = max(ay, by)
-        x2 = min(ax+aw, bx+bw); y2 = min(ay+ah, by+bh)
-        iw = max(0, x2-x1); ih = max(0, y2-y1)
-        inter = iw * ih
-        union = aw*ah + bw*bh - inter + 1e-6
-        return inter / union
-
-    def _suppress_overlaps(self, dets, iou_thr=0.85, center_px=8, prefer="match"):
+    def _compute_blobs(self, bgr: np.ndarray) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         """
-        Non-maximum suppression on detections. 'prefer' is 'match' or 'area'.
-        Keeps the best per overlap cluster and drops the rest.
+        Returns (overlay_bgr, blobs list). Each blob dict contains:
+        area, perim, bbox, solidity, circularity, aspect, holes_count, mean_intensity,
+        contour, holes[], quad, center[x,y], theta_deg, size_wh[w,h]
         """
-        if not dets:
-            return dets
-        if prefer == "match":
-            # smaller is better; inf for non-matching
-            key = lambda d: d.get("match", float("inf"))
-        else:
-            key = lambda d: -d["area"]
+        gray = self._pre_gray(bgr)
+        mask = self._threshold(gray)
 
-        dets_sorted = sorted(dets, key=key)
-        kept = []
-        for d in dets_sorted:
-            cx, cy = d["center"]
-            drop = False
-            for k in kept:
-                kcx, kcy = k["center"]
-                if (cx-kcx)**2 + (cy-kcy)**2 <= center_px**2:
-                    drop = True; break
-                if self._bbox_iou(d, k) >= iou_thr:
-                    drop = True; break
-            if not drop:
-                kept.append(d)
-        return kept
-    
-    def _compute_contours(self, bgr: np.ndarray, offset: Tuple[int,int]=(0,0)) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-        """
-        Return (overlay_bgr, detections list).
-        Each det: {"area":float,"perim":float,"bbox":(x,y,w,h),"solidity":float,"contour":cnt_np_int,"match":float|None}
-        If 'offset' is given, bbox/contours are shifted by (ox,oy) (used for ROI teaching).
-        Robust hole detection via RETR_CCOMP + border cleanup.
-        """
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        edges = self._canny_edges(gray)
-
-        # --- kill a 1px frame to prevent the “giant border contour” swallowing everything
-        eh, ew = edges.shape[:2]
-        if eh > 2 and ew > 2:
-            edges[0, :] = 0
-            edges[eh-1, :] = 0
-            edges[:, 0] = 0
-            edges[:, ew-1] = 0
-
-        # --- use CCOMP so we get outer ↔ holes directly
-        cnts, hier = cv2.findContours(edges, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if hier is None or len(cnts) == 0:
-            return (bgr if offset == (0,0) else self._last_frame_bgr), []
+            return bgr, []
 
-        hier = hier[0]  # (N, 4): [next, prev, first_child, parent]
+        hier = hier[0]  # [next, prev, first_child, parent]
         outer_ids = [i for i in range(len(cnts)) if hier[i][3] < 0]
 
-        ox, oy = offset
         dets: List[Dict[str, Any]] = []
-        REJECT_BORDER_TOUCHING = True  # set False if parts genuinely touch image edges
+        eh, ew = mask.shape[:2]
+        REJECT_BORDER_TOUCHING = True
+
+        min_area = int(self.sp_min_area.value())
+        max_area = int(self.sp_max_area.value())
+        asp_min = float(self.ds_aspect_min.value())
+        asp_max = float(self.ds_aspect_max.value())
+        sol_min = float(self.ds_solidity_min.value())
+        circ_min = float(self.ds_circ_min.value())
+        holes_min = int(self.sp_holes_min.value())
+        holes_max = int(self.sp_holes_max.value())
 
         for i in outer_ids:
             c = cnts[i]
 
-            # gather direct children (holes) by walking siblings
+            # children (holes)
             hole_ids = []
-            ch = hier[i][2]  # first_child
+            ch = hier[i][2]
             while ch != -1:
                 hole_ids.append(ch)
-                ch = hier[ch][0]  # next sibling
+                ch = hier[ch][0]
             holes = [cnts[k] for k in hole_ids]
 
-            # geometry with hole-aware area / perimeter
             outer_area = float(cv2.contourArea(c))
             holes_area = float(sum(cv2.contourArea(hh) for hh in holes))
             area = max(0.0, outer_area - holes_area)
-
             perim_outer = float(cv2.arcLength(c, True))
             perim_holes = float(sum(cv2.arcLength(hh, True) for hh in holes))
-            perim_total = perim_outer + perim_holes
+            perim = perim_outer + perim_holes
 
-            x, y, w, h = cv2.boundingRect(c)
+            x,y,w,h = cv2.boundingRect(c)
             if REJECT_BORDER_TOUCHING and (x <= 0 or y <= 0 or x + w >= ew-1 or y + h >= eh-1):
                 continue
 
-            ar = w / max(1, h)
             hull = cv2.convexHull(c)
             hull_area = float(cv2.contourArea(hull))
             solidity = area / max(1.0, hull_area)
+            aspect = w / max(1, h)
 
-            # --- apply UI filters ---
-            if area < int(self.sp_min_area.value()):
-                continue
-            ma = int(self.sp_max_area.value())
-            if ma > 0 and area > ma:
-                continue
-            if perim_total < float(self.ds_perim_min.value()):
-                continue
-            if not (float(self.ds_aspect_min.value()) <= ar <= float(self.ds_aspect_max.value())):
-                continue
-            if solidity < float(self.ds_solidity_min.value()):
-                continue
+            # circularity (robust to scale): 4πA / P^2
+            circularity = (4.0 * np.pi * area) / max(1.0, perim*perim)
 
+            # holes count
+            holes_count = len(holes)
+
+            # mean intensity inside the filled outer contour (excluding holes)
+            mask_poly = np.zeros_like(mask)
+            cv2.drawContours(mask_poly, [c], -1, 255, thickness=-1)
+            for hh in holes:
+                cv2.drawContours(mask_poly, [hh], -1, 0, thickness=-1)
+            meanI = float(cv2.mean(gray, mask=mask_poly)[0])
+
+            # UI filters
+            if area < min_area: continue
+            if max_area > 0 and area > max_area: continue
+            if not (asp_min <= aspect <= asp_max): continue
+            if solidity < sol_min: continue
+            if circularity < circ_min: continue
+            if not (holes_min <= holes_count <= holes_max): continue
+            if bool(self.chk_int_gate.isChecked()):
+                i_min = int(self.sp_int_min.value()); i_max = int(self.sp_int_max.value())
+                if not (i_min <= meanI <= i_max): continue
+                
+            # --- orientation via minAreaRect (snap to {0, 90} and rebuild box) ---
             rect = cv2.minAreaRect(c)
-            box = np.int32(np.round(cv2.boxPoints(rect)))
-            ((_, _), (RW, RH), Rangle) = rect
-            theta_deg = float(Rangle + 90.0) if RW > RH else float(Rangle)
+            (cx_r, cy_r), (RW, RH), Rangle = rect   # OpenCV: Rangle in (-90, 0]
 
-            # shift for ROI offset
-            c_shift = (c + np.array([[[ox, oy]]], dtype=c.dtype))
-            holes_shift = [(hh + np.array([[[ox, oy]]], dtype=hh.dtype)) for hh in holes]
-            box[:, 0] += ox; box[:, 1] += oy
+            # OpenCV’s angle is defined with the side length ambiguity; make a 0..90 measure
+            angle = float(Rangle)
+            if RW < RH:
+                angle += 90.0  # now 'angle' is 0..90 for the long side
+
+            # If nearly square/round, lock to 0 (to avoid jitter)
+            aspect_ratio = min(RW, RH) / max(RW, RH + 1e-9)
+            near_square = aspect_ratio > 0.85
+
+            # Final snapped angle: only 0 or 90
+            if near_square:
+                theta_deg = 0.0
+            else:
+                theta_deg = 0.0 if abs(angle) < 45.0 else 90.0
+
+            # Rebuild a rectangle with the snapped angle and get its box points
+            snapped_rect = ((cx_r, cy_r), (RW, RH), theta_deg if RW >= RH else theta_deg - 90.0)
+            box = cv2.boxPoints(snapped_rect)
+            box = np.int32(np.round(box))
+
+            # (Optionally keep theta in [-90, 90] for publishing)
+            if theta_deg > 90.0:  theta_deg -= 180.0
+            if theta_deg < -90.0: theta_deg += 180.0
 
             dets.append({
                 "area": area,
-                "perim": perim_total,
-                "bbox": (x + ox, y + oy, w, h),
+                "perim": perim,
+                "bbox": (x, y, w, h),
                 "solidity": solidity,
-                "contour": c_shift,
-                "holes": holes_shift,
+                "circularity": circularity,
+                "aspect": aspect,
+                "holes_count": holes_count,
+                "mean_intensity": meanI,
+                "contour": c,
+                "holes": holes,
                 "quad": box.tolist(),
-                "center": [int(x + w/2 + ox), int(y + h/2 + oy)],
+                "center": [int(x + w/2), int(y + h/2)],
                 "theta_deg": theta_deg,
                 "size_wh": [int(w), int(h)],
-                "holes_count": len(holes),
-                "holes_area": holes_area,
-                "match": None,
             })
 
-        # --- compute match scores (lower is better) before suppression ---
-        tpl_selected = (0 <= self._active_index < len(self._templates))
-        if tpl_selected and len(dets) > 0:
-            tpl = self._templates[self._active_index]
-            area_tol_pct = max(0, int(self.sp_area_tol.value()))
-            perim_tol_pct = max(0, int(self.sp_perim_tol.value()))
-            method = self.cmb_metric.currentText()
-            met = { "I1": cv2.CONTOURS_MATCH_I1, "I2": cv2.CONTOURS_MATCH_I2, "I3": cv2.CONTOURS_MATCH_I3 }.get(method, cv2.CONTOURS_MATCH_I1)
-
-            for d in dets:
-                area_ok = True; perim_ok = True
-                if tpl["area"] > 1:
-                    diffA = abs(d["area"] - tpl["area"]) * 100.0 / tpl["area"]
-                    area_ok = diffA <= area_tol_pct
-                if tpl["perim"] > 1:
-                    diffP = abs(d["perim"] - tpl["perim"]) * 100.0 / tpl["perim"]
-                    perim_ok = diffP <= perim_tol_pct
-                try:
-                    score_n = float(cv2.matchShapes(d["contour"], tpl["contour"], met, 0.0))
-                    c_m = tpl.get("contour_mirror")
-                    if c_m is not None:
-                        score_m = float(cv2.matchShapes(d["contour"], c_m, met, 0.0))
-                        score = min(score_n, score_m)
-                    else:
-                        score = score_n
-                except Exception:
-                    score = float("inf")
-                d["match"] = score if (area_ok and perim_ok) else float("inf")
-        else:
-            for d in dets:
-                d["match"] = None
-
-        # --- non-max suppression (prefer best match if template, else largest area) ---
-        dets = self._suppress_overlaps(
-            dets,
-            iou_thr=0.90,
-            center_px=8,
-            prefer="match" if tpl_selected else "area"
-        )
-
-        # --- filter by match threshold / sort / keepN ---
-        if tpl_selected:
-            thr = float(self.ds_match_thr.value())
-            dets = [d for d in dets if np.isfinite(d["match"]) and d["match"] <= thr]
-            dets.sort(key=lambda d: d["match"])  # best first
-        else:
-            dets.sort(key=lambda d: d["area"], reverse=True)
-
+        # rank & keepN
+        dets.sort(key=lambda d: d["area"], reverse=True)
         keepN = int(self.sp_keepN.value())
-        if len(dets) > keepN:
-            dets = dets[:keepN]
+        if len(dets) > keepN: dets = dets[:keepN]
 
-        # --- draw overlay ---
-        vis = bgr.copy() if offset == (0,0) else self._last_frame_bgr.copy()
+        # draw overlay
+        vis = bgr.copy()
         if self.chk_draw_cnt.isChecked():
             for d in dets:
                 cv2.drawContours(vis, [d["contour"]], -1, (0,255,255), 2)
@@ -1356,20 +926,17 @@ class MainWindow(QtWidgets.QMainWindow):
         for i, d in enumerate(dets):
             x,y,w,h = d["bbox"]
             if self.chk_draw_box.isChecked():
-                color = (0,255,0)
-                if d.get("match") is not None and np.isfinite(d["match"]):
-                    color = (0,128,255)
-                cv2.rectangle(vis, (x,y), (x+w,y+h), color, 2)
+                cv2.rectangle(vis, (x,y), (x+w,y+h), (0,255,0), 2)
+                if d.get("quad"):
+                    q = np.array(d["quad"], dtype=np.int32)
+                    cv2.polylines(vis, [q], True, (0,128,255), 2)
             if self.chk_draw_cent.isChecked():
-                cx, cy = x + w//2, y + h//2
+                cx, cy = d["center"]
                 cv2.circle(vis, (cx,cy), 4, (255,0,0), -1)
             if self.chk_draw_ids.isChecked():
-                label = f"#{i}"
-                if d.get("match") is not None and np.isfinite(d["match"]):
-                    label += f" m={d['match']:.3f}"
-                cv2.putText(vis, label, (x, max(0, y-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1, cv2.LINE_AA)
+                lab = f"#{i} A={int(d['area'])} S={d['solidity']:.2f} C={d['circularity']:.3f} H={d['holes_count']}"
+                cv2.putText(vis, lab, (x, max(0,y-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1, cv2.LINE_AA)
 
-        # brief persistence for smoother viewing
         try:
             jpeg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 80])[1].tobytes()
             qi = QtGui.QImage.fromData(jpeg, "JPG")
@@ -1378,20 +945,57 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        return vis if offset == (0,0) else self._last_frame_bgr, dets
-    
-    def _publish_vgr_result(self, dets: List[Dict[str, Any]], forced_name: Optional[str] = None, ocr_score: Optional[float] = None):
-        """
-        Same payload as before. 'name' is forced by OCR ("go"/"nogo").
-        If no contours, we send an empty result like before.
-        """
+        return vis, dets
+
+    # ───────────────────────── GO/NOGO publishing ─────────────────────────
+
+    def _choose_blob(self, dets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not dets:
+            return None
+        if self.rad_pick_largest.isChecked():
+            return dets[0]  # already sorted by area
+        # simple score: favor round, solid, big
+        return max(dets, key=lambda d: d["circularity"] * d["solidity"] * max(1.0, d["area"]))
+
+    def _passes_rules(self, d: Dict[str, Any]) -> bool:
+        # We already applied basic gates in _compute_blobs.
+        # Here we only enforce the existence rule (and could add extra business logic if needed).
+        if d is None:
+            return False
+        return True
+
+    def _publish_vgr_result(self, dets: List[Dict[str, Any]]):
         if not self.chk_pub_robot.isChecked():
             return
 
-        # choose a geometry carrier (largest-area contour or first)
-        best_det = dets[0] if dets else None
+        # ── rules
+        count_detected = len(dets)
+        expected_blobs = int(self.sp_expected_count.value())
+        expected_holes = int(self.sp_expected_holes.value())
 
-        if best_det is None:
+        # Blobs rule
+        is_ok_blobs = (count_detected == expected_blobs)
+        if self.chk_at_least.isChecked():
+            is_ok_blobs = (count_detected >= expected_blobs)
+
+        # Choose primary blob (same policy as before)
+        chosen = self._choose_blob(dets) if dets else None
+
+        # Holes rule (by default, use holes in the primary blob)
+        holes_measured = chosen["holes_count"] if chosen else 0
+        is_ok_holes = (holes_measured == expected_holes)
+        if self.chk_holes_at_least.isChecked():
+            is_ok_holes = (holes_measured >= expected_holes)
+
+        # If you prefer TOTAL holes across all blobs instead of primary:
+        # holes_measured = sum(d["holes_count"] for d in dets)
+        # (leave the rest unchanged)
+
+        # Final decision = BOTH rules
+        is_ok = (is_ok_blobs and is_ok_holes)
+        send_name = "go" if is_ok else "nogo"
+
+        if chosen is None:
             payload = {
                 "version":"1.0",
                 "sdk":"vision_ui",
@@ -1401,29 +1005,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 "result": {"objects": [], "counts": {"objects": 0, "detections": 0}}
             }
             self.pub_vgr.send_json(payload)
-            self._append_log("VGR ← empty (no detections)")
+            self.pub_robot.send_json(payload)
+            self._append_log(f"VGR ← {send_name} (blobs={count_detected}/{expected_blobs}, holes={holes_measured}/{expected_holes}) [no blobs]")
             return
 
-        # geometry from contour (unchanged)
-        x, y, w, h = best_det["bbox"]
-        cx, cy = best_det.get("center", [int(x + w/2), int(y + h/2)])
-        quad = best_det.get("quad")
-        inst_id = 0
-        inliers = int(len(best_det.get("contour", [])))
-        theta = float(best_det.get("theta_deg", 0.0))
-        size_wh = best_det.get("size_wh", [int(w), int(h)])
+        # build one det (unchanged)
+        x, y, w, h = chosen["bbox"]
+        cx, cy = chosen.get("center", [int(x + w/2), int(y + h/2)])
+        quad = chosen.get("quad")
+        theta = float(chosen.get("theta_deg", 0.0))
+        size_wh = chosen.get("size_wh", [int(w), int(h)])
 
-        # name is forced by OCR; fallback to "nogo" if missing
-        send_name = forced_name if forced_name in ("go","nogo") else "nogo"
-        score = float(ocr_score if (ocr_score is not None) else 1.0)  # keep positive
+        score = float(chosen["solidity"])
+        score = float(max(0.0, min(1.0, score)))
 
         det_obj = {
-            "instance_id": inst_id,
+            "instance_id": 0,
             "score": float(score),
-            "inliers": inliers,
+            "inliers": int(len(chosen.get("contour", []))),
             "pose": {
-                "x": float(cx), "y": float(cy), "theta_deg": float(theta),
-                "x_scale": 1.0, "y_scale": 1.0,
+                "x": float(cx),
+                "y": float(cy),
+                "theta_deg": float(theta),
+                "x_scale": 1.0,
+                "y_scale": 1.0,
                 "origin_xy": [float(quad[0][0]), float(quad[0][1])] if quad else [float(x), float(y)]
             },
             "center": [float(cx), float(cy)],
@@ -1432,7 +1037,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         obj = {
             "object_id": 1,
-            "name": send_name,                  # ← only change that matters downstream
+            "name": send_name,
             "template_size": [int(size_wh[0]), int(size_wh[1])],
             "detections": [det_obj]
         }
@@ -1447,7 +1052,11 @@ class MainWindow(QtWidgets.QMainWindow):
         }
 
         self.pub_vgr.send_json(payload)
-        self._append_log(f"VGR ← {send_name}  ocr_conf={score:.2f} px=({cx:.1f},{cy:.1f}) yaw={theta:.2f}° size={size_wh}")
+        self.pub_robot.send_json(payload)
+        self._append_log(
+            f"VGR ← {send_name}  blobs={count_detected}/{expected_blobs}  holes={holes_measured}/{expected_holes}  "
+            f"px=({cx:.1f},{cy:.1f}) yaw={theta:.2f}° size={size_wh}"
+        )
 
     # ───────────────────────── settings ─────────────────────────
 
@@ -1505,89 +1114,77 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self.cmb_w.blockSignals(False); self.sp_every.blockSignals(False)
 
-        # Robot
+        # Robot + VGR
         robot_ip = to_str(S.value('robot/ip'))
         if robot_ip: self.ed_robot_ip.setText(robot_ip)
         rp = to_int(S.value('robot/port'))
         if rp: self.sp_robot_port.setValue(rp)
         ap = to_bool(S.value('robot/auto_publish'))
         if ap is not None: self.chk_pub_robot.setChecked(ap)
-        # --- add to _load_settings(...) after Robot settings ---
         vgr_ip = to_str(S.value('vgr/ip'))
-        if vgr_ip:
-            self.ed_vgr_ip.setText(vgr_ip)
+        if vgr_ip: self.ed_vgr_ip.setText(vgr_ip)
         vp = to_int(S.value('vgr/port'))
-        if vp:
-            self.sp_vgr_port.setValue(vp)
+        if vp: self.sp_vgr_port.setValue(vp)
 
-        # Canny / Preproc defaults
+        # Blob pipeline
         try:
-            self.chk_clahe.setChecked(bool(to_bool(S.value('canny/clahe')) or False))
-            v = to_float(S.value('canny/clip')); self.ds_clip.setValue(v if v is not None else 2.0)
-            i = to_int(S.value('canny/tiles')); self.sp_tiles.setValue(i if i is not None else 8)
-            i = to_int(S.value('canny/blur')); self.sp_blur.setValue(i if i is not None else 5)
-            i = to_int(S.value('canny/lo')); self.sp_canny_lo.setValue(i if i is not None else 50)
-            i = to_int(S.value('canny/hi')); self.sp_canny_hi.setValue(i if i is not None else 150)
-            s = to_str(S.value('canny/ap')); 
-            if s and self.cmb_canny_ap.findText(s) >= 0: self.cmb_canny_ap.setCurrentText(s)
-            self.chk_l2.setChecked(bool(to_bool(S.value('canny/l2')) or True))
-            i = to_int(S.value('canny/dilate')); self.sp_dilate.setValue(i if i is not None else 1)
+            self.chk_clahe.setChecked(bool(to_bool(S.value('blob/clahe')) or False))
+            v = to_float(S.value('blob/clip')); self.ds_clip.setValue(v if v is not None else 2.0)
+            i = to_int(S.value('blob/tiles')); self.sp_tiles.setValue(i if i is not None else 8)
+            i = to_int(S.value('blob/blur')); self.sp_blur.setValue(i if i is not None else 5)
+            s = to_str(S.value('blob/thr_mode')); 
+            if s and self.cmb_thr_mode.findText(s) >= 0: self.cmb_thr_mode.setCurrentText(s)
+            i = to_int(S.value('blob/thr_val')); self.sp_thr_val.setValue(i if i is not None else 128)
+            s = to_str(S.value('blob/polarity')); 
+            if s and self.cmb_polarity.findText(s) >= 0: self.cmb_polarity.setCurrentText(s)
+            i = to_int(S.value('blob/open')); self.sp_open.setValue(i if i is not None else 1)
+            i = to_int(S.value('blob/close')); self.sp_close.setValue(i if i is not None else 1)
         except Exception:
             pass
 
         # Filters
         try:
-            i = to_int(S.value('filter/min_area')); self.sp_min_area.setValue(i if i is not None else 200)
+            i = to_int(S.value('filter/min_area')); self.sp_min_area.setValue(i if i is not None else 300)
             i = to_int(S.value('filter/max_area')); self.sp_max_area.setValue(i if i is not None else 0)
             f = to_float(S.value('filter/aspect_min')); self.ds_aspect_min.setValue(f if f is not None else 0.0)
             f = to_float(S.value('filter/aspect_max')); self.ds_aspect_max.setValue(f if f is not None else 100.0)
             f = to_float(S.value('filter/solidity')); self.ds_solidity_min.setValue(f if f is not None else 0.0)
-            f = to_float(S.value('filter/perim_min')); self.ds_perim_min.setValue(f if f is not None else 0.0)
+            f = to_float(S.value('filter/circularity')); self.ds_circ_min.setValue(f if f is not None else 0.0)
+            i = to_int(S.value('filter/holes_min')); self.sp_holes_min.setValue(i if i is not None else 0)
+            i = to_int(S.value('filter/holes_max')); self.sp_holes_max.setValue(i if i is not None else 100)
             i = to_int(S.value('filter/keepN')); self.sp_keepN.setValue(i if i is not None else 50)
         except Exception:
             pass
 
-        # Matching
+        # Selection + intensity + decision
         try:
-            s = to_str(S.value('match/metric')); 
-            if s and self.cmb_metric.findText(s) >= 0: self.cmb_metric.setCurrentText(s)
-            f = to_float(S.value('match/thr')); self.ds_match_thr.setValue(f if f is not None else 0.10)
-            i = to_int(S.value('match/area_tol')); self.sp_area_tol.setValue(i if i is not None else 25)
-            i = to_int(S.value('match/perim_tol')); self.sp_perim_tol.setValue(i if i is not None else 20)
-            b = to_bool(S.value('match/require_tpl')); self.chk_require_active.setChecked(b if b is not None else False)
+            b = to_bool(S.value('sel/pick_best'))
+            if b is True: self.rad_pick_best.setChecked(True)
+            else: self.rad_pick_largest.setChecked(True)
+            b = to_bool(S.value('intensity/enabled')); self.chk_int_gate.setChecked(b if b is not None else False)
+            i = to_int(S.value('intensity/min')); self.sp_int_min.setValue(i if i is not None else 0)
+            i = to_int(S.value('intensity/max')); self.sp_int_max.setValue(i if i is not None else 255)
         except Exception:
             pass
-        
-        # OCR
-        try:
-            s = to_str(S.value('ocr/target'))
-            if s is not None:
-                self.ed_ocr_target.setText(s)
+        i = to_int(S.value('decision/expected_count')); 
+        self.sp_expected_count.setValue(i if i is not None else 1)
+        b = to_bool(S.value('decision/at_least'))
+        if hasattr(self, 'chk_at_least') and b is not None:
+            self.chk_at_least.setChecked(b)
+            
+        i = to_int(S.value('decision/expected_count')); 
+        self.sp_expected_count.setValue(i if i is not None else 1)
 
-            s = to_str(S.value('ocr/match'))
-            if s and self.cb_ocr_match.findText(s) >= 0:
-                self.cb_ocr_match.setCurrentText(s)
+        i = to_int(S.value('decision/expected_holes'));
+        self.sp_expected_holes.setValue(i if i is not None else 0)
 
-            b = to_bool(S.value('ocr/case'))
-            if b is not None:
-                self.chk_ocr_case.setChecked(b)
+        b = to_bool(S.value('decision/at_least'))
+        if b is not None: self.chk_at_least.setChecked(b)
 
-            f = to_float(S.value('ocr/minconf'))
-            if f is not None:
-                self.ds_ocr_minconf.setValue(f)
+        b = to_bool(S.value('decision/holes_at_least'))
+        if b is not None: self.chk_holes_at_least.setChecked(b)
 
-            b = to_bool(S.value('ocr/pre'))
-            if b is not None:
-                self.chk_ocr_pre.setChecked(b)
 
-            b = to_bool(S.value('ocr/use'))
-            if b is not None:
-                self.chk_use_ocr.setChecked(b)
-        except Exception:
-            pass
-
-        # Template library (paths not persisted; contours can be huge → user saves to JSON)
-        # Logs
         logs_json = to_str(S.value('logs/history')); self._log_buffer = []
         if logs_json:
             try:
@@ -1613,16 +1210,16 @@ class MainWindow(QtWidgets.QMainWindow):
         S.setValue('processing/proc_width', self.cmb_w.currentText())
         S.setValue('processing/detect_every', int(self.sp_every.value()))
 
-        # Canny / preproc
-        S.setValue('canny/clahe', bool(self.chk_clahe.isChecked()))
-        S.setValue('canny/clip', float(self.ds_clip.value()))
-        S.setValue('canny/tiles', int(self.sp_tiles.value()))
-        S.setValue('canny/blur', int(self.sp_blur.value()))
-        S.setValue('canny/lo', int(self.sp_canny_lo.value()))
-        S.setValue('canny/hi', int(self.sp_canny_hi.value()))
-        S.setValue('canny/ap', self.cmb_canny_ap.currentText())
-        S.setValue('canny/l2', bool(self.chk_l2.isChecked()))
-        S.setValue('canny/dilate', int(self.sp_dilate.value()))
+        # Blob pipeline
+        S.setValue('blob/clahe', bool(self.chk_clahe.isChecked()))
+        S.setValue('blob/clip', float(self.ds_clip.value()))
+        S.setValue('blob/tiles', int(self.sp_tiles.value()))
+        S.setValue('blob/blur', int(self.sp_blur.value()))
+        S.setValue('blob/thr_mode', self.cmb_thr_mode.currentText())
+        S.setValue('blob/thr_val', int(self.sp_thr_val.value()))
+        S.setValue('blob/polarity', self.cmb_polarity.currentText())
+        S.setValue('blob/open', int(self.sp_open.value()))
+        S.setValue('blob/close', int(self.sp_close.value()))
 
         # Filters
         S.setValue('filter/min_area', int(self.sp_min_area.value()))
@@ -1630,36 +1227,31 @@ class MainWindow(QtWidgets.QMainWindow):
         S.setValue('filter/aspect_min', float(self.ds_aspect_min.value()))
         S.setValue('filter/aspect_max', float(self.ds_aspect_max.value()))
         S.setValue('filter/solidity', float(self.ds_solidity_min.value()))
-        S.setValue('filter/perim_min', float(self.ds_perim_min.value()))
+        S.setValue('filter/circularity', float(self.ds_circ_min.value()))
+        S.setValue('filter/holes_min', int(self.sp_holes_min.value()))
+        S.setValue('filter/holes_max', int(self.sp_holes_max.value()))
         S.setValue('filter/keepN', int(self.sp_keepN.value()))
 
-        # Matching
-        S.setValue('match/metric', self.cmb_metric.currentText())
-        S.setValue('match/thr', float(self.ds_match_thr.value()))
-        S.setValue('match/area_tol', int(self.sp_area_tol.value()))
-        S.setValue('match/perim_tol', int(self.sp_perim_tol.value()))
-        S.setValue('match/require_tpl', bool(self.chk_require_active.isChecked()))
-
-        # Camera dock
-        S.setValue('camera/state', json.dumps(getattr(self.cam_panel, "get_state", lambda: {})()))
-        
-        # OCR
-        S.setValue('ocr/target', self.ed_ocr_target.text())
-        S.setValue('ocr/match', self.cb_ocr_match.currentText())
-        S.setValue('ocr/case', bool(self.chk_ocr_case.isChecked()))
-        S.setValue('ocr/minconf', float(self.ds_ocr_minconf.value()))
-        S.setValue('ocr/pre', bool(self.chk_ocr_pre.isChecked()))
-        S.setValue('ocr/use', bool(self.chk_use_ocr.isChecked()))
+        # Selection + intensity + decision
+        S.setValue('sel/pick_best', bool(self.rad_pick_best.isChecked()))
+        S.setValue('intensity/enabled', bool(self.chk_int_gate.isChecked()))
+        S.setValue('intensity/min', int(self.sp_int_min.value()))
+        S.setValue('intensity/max', int(self.sp_int_max.value()))
+        S.setValue('decision/expected_count', int(self.sp_expected_count.value()))
+        S.setValue('decision/at_least', bool(self.chk_at_least.isChecked()))
+        S.setValue('decision/expected_count', int(self.sp_expected_count.value()))
+        S.setValue('decision/expected_holes', int(self.sp_expected_holes.value()))
+        S.setValue('decision/at_least', bool(self.chk_at_least.isChecked()))
+        S.setValue('decision/holes_at_least', bool(self.chk_holes_at_least.isChecked()))
 
 
-        # Robot + logs
+        # Robot + VGR + logs
         S.setValue('robot/ip', self.ed_robot_ip.text())
         S.setValue('robot/port', int(self.sp_robot_port.value()))
         S.setValue('robot/auto_publish', bool(self.chk_pub_robot.isChecked()))
-        S.setValue('logs/history', json.dumps(self._log_buffer[-200:]))
-        # --- add to _save_settings(...) after Robot settings ---
         S.setValue('vgr/ip', self.ed_vgr_ip.text())
         S.setValue('vgr/port', int(self.sp_vgr_port.value()))
+        S.setValue('logs/history', json.dumps(self._log_buffer[-200:]))
 
         S.sync()
 
