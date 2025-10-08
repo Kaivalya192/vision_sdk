@@ -22,49 +22,35 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets, QtWebSockets
-# --- PaddleOCR stability flags (same as your OCR app) ---
-import os as _os
-_os.environ.setdefault("FLAGS_use_mkldnn", "0")
-_os.environ.setdefault("FLAGS_enable_mkldnn", "0")
-_os.environ.setdefault("ONEDNN_PRIMITIVE_CACHE_CAPACITY", "0")
-_os.environ.setdefault("OMP_NUM_THREADS", "1")
-_os.environ.setdefault("MKL_NUM_THREADS", "1")
-
-
 def _lazy_paddleocr():
     import re
     from paddleocr import PaddleOCR, __version__ as _pocr_ver
 
     def _parse_ver(s: str):
         m = re.findall(r"\d+", s)
-        while len(m) < 3:
-            m.append("0")
+        while len(m) < 3: m.append("0")
         return tuple(int(x) for x in m[:3])
 
-    v = _parse_ver(_pocr_ver)  # e.g., (3, 2, 0)
+    v = _parse_ver(_pocr_ver)  # e.g., (3,2,0)
 
     if v >= (3, 0, 0):
-        # PaddleOCR 3.x — new arg names, and `max_batch_size` was removed.
+        # PaddleOCR 3.x — use new flags; DO NOT pass max_batch_size/use_gpu
         return PaddleOCR(
             device='cpu',
             use_textline_orientation=True,
             lang='en',
-            # renamed parameters (only set if you want to override defaults):
-            text_detection_model_dir=None,      # was det_model_dir
-            text_recognition_model_dir=None,    # was rec_model_dir
-            text_det_limit_side_len=1536,       # was det_limit_side_len
-            # NOTE: do NOT pass max_batch_size here
-            # If you later need batching, look at rec_batch_num/text_rec_batch_num in docs.
+            # only set these if you want to override defaults; None means “use built-in”
+            text_detection_model_dir=None,
+            text_recognition_model_dir=None,
+            text_det_limit_side_len=1536,
         )
     else:
-        # PaddleOCR 2.x — legacy args still valid
+        # PaddleOCR 2.x — legacy args
         return PaddleOCR(
             use_angle_cls=True, lang='en',
             det_model_dir=None, rec_model_dir=None,
-            use_gpu=False,
-            ir_optim=False, enable_mkldnn=False, cpu_threads=1,
-            det_limit_side_len=1536, det_db_score_mode='fast',
-            max_batch_size=4
+            use_gpu=False, ir_optim=False, enable_mkldnn=False, cpu_threads=1,
+            det_limit_side_len=1536, det_db_score_mode='fast', max_batch_size=4
         )
 
 
@@ -375,6 +361,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_ts = time.perf_counter()
         self._settings = QtCore.QSettings('vision_sdk', 'ui_canny_contour')
         self._log_buffer: List[str] = []
+        
+        # snapshots dir (stable across working dirs)
+        self._app_dir = os.path.abspath(os.path.dirname(__file__))
+        self._out_dir = os.path.join(self._app_dir, "output")
+        os.makedirs(self._out_dir, exist_ok=True)
+        # (log later, after self.txt_log exists)
 
         self._last_frame_bgr: Optional[np.ndarray] = None
         self._last_overlay: Optional[QtGui.QImage] = None
@@ -567,13 +559,19 @@ class MainWindow(QtWidgets.QMainWindow):
         right = QtWidgets.QVBoxLayout()
         grp = QtWidgets.QGroupBox("Contours (last run)")
         vv = QtWidgets.QVBoxLayout(grp)
-        self.tbl = QtWidgets.QTableWidget(0, 9)
-        self.tbl.setHorizontalHeaderLabels(["id","area","perim","x","y","w","h","solidity","match"])
+        self.tbl = QtWidgets.QTableWidget(0, 10)
+        self.tbl.setHorizontalHeaderLabels(
+            ["id","area","perim","x","y","w","h","solidity","match","ocr"]
+        )        
         self.tbl.horizontalHeader().setStretchLastSection(True)
+        self._last_ocr_summary = "—"
+
         vv.addWidget(self.tbl)
         right.addWidget(grp, 1)
 
         self.txt_log = QtWidgets.QTextEdit(); self.txt_log.setReadOnly(True)
+        self._append_log(f"[INIT] snapshot dir = {self._out_dir}")
+
         right.addWidget(QtWidgets.QLabel("Log")); right.addWidget(self.txt_log, 1)
         rightw = QtWidgets.QWidget(); rlay = QtWidgets.QVBoxLayout(rightw); rlay.addLayout(right)
         root.addWidget(rightw, 0)
@@ -866,6 +864,11 @@ class MainWindow(QtWidgets.QMainWindow):
             del self._templates[i]
             self._refresh_tpl_list()
             self._active_index = self.lst_tpl.currentRow()
+            
+    def _update_ocr_summary(self, decision: str, best: float, res: dict):
+        cnt = len(res.get("detections", [])) if isinstance(res, dict) else 0
+        ms  = res.get("infer_ms", 0.0) if isinstance(res, dict) else 0.0
+        self._last_ocr_summary = f"{decision} {best:.2f} ({cnt},{ms:.0f}ms)"
 
     def _save_library(self):
         fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Template Library", "canny_templates.json", "JSON (*.json)")
@@ -945,98 +948,111 @@ class MainWindow(QtWidgets.QMainWindow):
         img_bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         img_bgr = cv2.bilateralFilter(img_bgr, d=5, sigmaColor=40, sigmaSpace=40)
         return img_bgr
+    
+    @staticmethod
+    def _coerce_blocks(pred):
+        """
+        Normalize PaddleOCR 3.x predict() outputs to plain dict blocks.
+        Handles:
+        - objects with attribute `.res` (PaddleX Result)
+        - dicts like {'res': {...}}
+        - plain dicts already containing polys/texts/scores
+        Returns: list of dicts
+        """
+        seq = pred if isinstance(pred, list) else [pred]
+        out = []
+        for item in seq:
+            blk = item
+            # 3.x often returns a PaddleX Result object with `.res`
+            if hasattr(blk, "res"):
+                blk = blk.res
+            # sometimes it’s a dict that nests 'res'
+            if isinstance(blk, dict) and "res" in blk and isinstance(blk["res"], dict):
+                blk = blk["res"]
+            out.append(blk)
+        return out
 
     def _ocr__run(self, bgr: np.ndarray, do_pre: bool, min_conf: float) -> dict:
         """
         Returns: {"detections":[{"text","confidence","bbox"}], "infer_ms": float}
-        bbox = 4x2 polygon in full-frame pixel coords
         """
         import time, cv2
-        import numpy as _np
-        from PIL import Image
+        if bgr is None:
+            return {"detections": [], "infer_ms": 0.0}
 
-        if bgr is None: return {"detections":[], "infer_ms":0.0}
+        # if OCR is disabled or target is empty → return immediately (extra safety)
+        if (not bool(self.chk_use_ocr.isChecked())) or (self.ed_ocr_target.text().strip() == ""):
+            return {"detections": [], "infer_ms": 0.0}
+
         img = bgr.copy()
-        if do_pre: img = self._ocr__preprocess(img)
+        if do_pre:
+            img = self._ocr__preprocess(img)
 
-        # modest upscaling if still small
+        # modest upscaling only (keeps latency down)
         h0, w0 = img.shape[:2]
         scale = 1.0
-        if max(h0, w0) < 1000:
-            scale = 1000.0 / max(h0, w0)
+        LIM = 896.0  # was 1000+, smaller is faster with very small accuracy cost
+        if max(h0, w0) < LIM:
+            scale = LIM / max(h0, w0)
             img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
         engine = getattr(self, "_paddle_engine", None)
         if engine is None:
             engine = _lazy_paddleocr()
-            self._paddle_engine = engine  # cache across triggers
+            self._paddle_engine = engine
 
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
+
         t0 = time.time()
         try:
-            # PaddleOCR 3.x prefers predict(img), 2.x used ocr(img, cls=True)
-            if hasattr(engine, "predict"):
-                result = engine.predict(_np.array(Image.fromarray(rgb)))
-            else:
-                result = engine.ocr(_np.array(Image.fromarray(rgb)), cls=True)
+            if hasattr(engine, "predict"):          # PaddleOCR 3.x
+                result = engine.predict(input=rgb)
+            else:                                   # PaddleOCR 2.x
+                result = engine.ocr(rgb, cls=True)
         except Exception as e:
-            # same safe retry pattern as before
             if any(k in str(e).lower() for k in ("primitive","onednn","fused_conv2d")):
                 engine = _lazy_paddleocr()
                 self._paddle_engine = engine
-                if hasattr(engine, "predict"):
-                    result = engine.predict(_np.array(Image.fromarray(rgb)))
-                else:
-                    result = engine.ocr(_np.array(Image.fromarray(rgb)), cls=True)
+                result = engine.predict(input=rgb) if hasattr(engine, "predict") else engine.ocr(rgb, cls=True)
             else:
                 raise
+
         infer_ms = (time.time() - t0) * 1000.0
 
         dets = []
-        inv_s = 1.0 / scale
+        inv_s = 1.0 / max(1.0, scale)
 
         def _emit(poly, text, score):
-            if float(score) < float(min_conf): 
+            if float(score) < float(min_conf):
                 return
-            box = _np.array(poly, dtype=_np.float32)
-            if box.ndim == 3:  # Nx1x2 -> Nx2
-                box = box[:,0,:]
+            box = np.array(poly, dtype=np.float32)
+            if box.ndim == 3:
+                box = box[:, 0, :]
             if scale != 1.0:
-                box[:,0] *= inv_s; box[:,1] *= inv_s
+                box[:, 0] *= inv_s
+                box[:, 1] *= inv_s
             dets.append({"text": str(text), "confidence": float(score), "bbox": box.tolist()})
 
-        # ---------- Parse both 2.x and 3.x shapes ----------
         if result:
-            # 2.x shape: [ [ [poly, (text, score)], ... ] ]
-            if isinstance(result, list) and result and isinstance(result[0], list):
-                for res in result:
-                    for line in res or []:
-                        try:
-                            poly, (txt, sc) = line
-                            _emit(poly, txt, sc)
-                        except Exception:
-                            continue
-            else:
-                # 3.x common shapes:
-                # a) dict with keys like: 'polys'/'boxes' + 'rec_texts' + 'rec_scores'
-                # b) dict with 'results': list of {'polygon'|'box'|'bbox', 'text', 'score'}
-                blocks = result if isinstance(result, list) else [result]
+            if isinstance(result, list) and result and isinstance(result[0], list):  # PaddleOCR 2.x
+                for page in result:
+                    for item in page or []:
+                        poly, (txt, sc) = item
+                        _emit(poly, txt, sc)
+            else:  # PaddleOCR 3.x shapes
+                blocks = self._coerce_blocks(result)
                 for blk in blocks:
                     if not isinstance(blk, dict):
                         continue
-                    # b)
                     if "results" in blk and isinstance(blk["results"], list):
                         for r in blk["results"]:
                             poly = r.get("polygon") or r.get("poly") or r.get("box") or r.get("bbox")
-                            txt  = r.get("text", "")
-                            sc   = r.get("score", 0.0)
-                            if poly is not None: _emit(poly, txt, sc)
+                            if poly is not None:
+                                _emit(poly, r.get("text", ""), r.get("score", 0.0))
                         continue
-                    # a)
-                    polys = blk.get("polys") or blk.get("boxes") or blk.get("det_polys") or blk.get("det_boxes")
-                    texts = blk.get("rec_texts") or blk.get("texts") or blk.get("rec_text")
-                    scores = blk.get("rec_scores") or blk.get("scores") or blk.get("rec_score")
+                    polys  = (blk.get("polys") or blk.get("boxes") or blk.get("det_polys") or blk.get("det_boxes") or blk.get("dt_polys"))
+                    texts  = (blk.get("rec_texts") or blk.get("texts") or blk.get("rec_text"))
+                    scores = (blk.get("rec_scores") or blk.get("scores") or blk.get("rec_score"))
                     if isinstance(polys, list) and isinstance(texts, list):
                         n = min(len(polys), len(texts), len(scores) if isinstance(scores, list) else len(texts))
                         for i in range(n):
@@ -1075,6 +1091,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self._send({"type": "trigger"})
         self._append_log("TRIGGER pressed → OCR-driven GO/NOGO from current frame")
         self._trigger_publish_once()
+        
+    def _render_ocr_overlay(self, bgr: np.ndarray, ocr_res: dict) -> np.ndarray:
+        img = bgr.copy()
+        if not isinstance(ocr_res, dict):
+            return img
+        for det in ocr_res.get("detections", []):
+            poly = np.array(det.get("bbox", []), dtype=np.int32).reshape(-1, 2)
+            if poly.shape[0] >= 4:
+                cv2.polylines(img, [poly], True, (255, 0, 0), 2, cv2.LINE_AA)
+                label = f"{det.get('text','')} ({float(det.get('confidence',0.0)):.2f})"
+                x, y = int(poly[0,0]), int(poly[0,1])
+                cv2.putText(img, label, (x, max(12, y - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    def _save_ocr_snapshot(self, bgr: Optional[np.ndarray], ocr_res: dict, tag: str = "run"):
+        if bgr is None:
+            self._append_log("[OCR] skip save: no frame")
+            return
+        try:
+            vis = self._render_ocr_overlay(bgr, ocr_res)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            fn = os.path.join(self._out_dir, f"ocr_{tag}_{ts}.jpg")
+            ok = cv2.imwrite(fn, vis)
+            if ok:
+                cnt = len(ocr_res.get("detections", [])) if isinstance(ocr_res, dict) else 0
+                self._append_log(f"[OCR] saved {fn}  (detections={cnt})")
+            else:
+                self._append_log(f"[OCR] save failed (cv2.imwrite returned False): {fn}")
+        except Exception as e:
+            self._append_log(f"[OCR] save error: {e}")
 
     def _on_udp_trigger(self):
         if not self.rad_trig.isChecked():
@@ -1086,27 +1133,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def _trigger_publish_once(self):
         if self._last_frame_bgr is not None:
             vis, dets = self._compute_contours(self._last_frame_bgr)
-            # OCR decision (full-frame) → name = "go"/"nogo"
             name, ocr_conf, ocr_res = self._ocr__decide_go_nogo(self._last_frame_bgr)
+            
+            self._save_ocr_snapshot(self._last_frame_bgr, ocr_res, tag=f"trigger_{name}")
+
             self._append_log(f"[OCR] detections={len(ocr_res['detections'])} best_match_conf={ocr_conf:.2f}")
-            self._show_image(vis)
+
+            # draw OCR on top of contour visualization and hold 5s
+            self._draw_ocr(vis, ocr_res)
+            self._set_overlay(vis, ttl_sec=5.0)
+
+            # update table + publish
+            self._update_ocr_summary(name, ocr_conf, ocr_res)
+            self._populate_table(dets)
             self._publish_vgr_result(dets, forced_name=name, ocr_score=ocr_conf)
+
             self._last_result_time = time.time()
             self._expect_one_result = False
+
         else:
             self._append_log("No frame yet → will publish after next frame")
             self._expect_one_result = True
 
 
-    def _process_and_update(self, publish: bool):
-        if self._last_frame_bgr is None:
-            self.status.showMessage("No frame yet", 1500)
-            return
-
-        vis, dets = self._compute_contours(self._last_frame_bgr)
-        self._show_image(vis)
-
-        # fill table
+    def _populate_table(self, dets: List[Dict[str, Any]]):
         self.tbl.setRowCount(0)
         for idx, d in enumerate(dets):
             r = self.tbl.rowCount(); self.tbl.insertRow(r)
@@ -1119,19 +1169,42 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(int(w))))
             self.tbl.setItem(r, 6, QtWidgets.QTableWidgetItem(str(int(h))))
             self.tbl.setItem(r, 7, QtWidgets.QTableWidgetItem(f'{d["solidity"]:.2f}'))
-            self.tbl.setItem(r, 8, QtWidgets.QTableWidgetItem("-" if d.get("match") is None else f'{d["match"]:.4f}'))
+            self.tbl.setItem(r, 8, QtWidgets.QTableWidgetItem(
+                "-" if d.get("match") is None else f'{d["match"]:.4f}'))
+            # NEW: OCR summary per row (same global OCR result shown in this run)
+            self.tbl.setItem(r, 9, QtWidgets.QTableWidgetItem(self._last_ocr_summary))
+            
+    def _process_and_update(self, publish: bool):
+        """Fast path in Training: skip OCR (keeps FPS high). Do OCR only in Trigger."""
+        if self._last_frame_bgr is None:
+            self.status.showMessage("No frame yet", 1500)
+            return
 
-        # In Trigger mode, do one-shot publish and latch result briefly
+        vis, dets = self._compute_contours(self._last_frame_bgr)
+
+        # ── OCR policy: only when Trigger mode to keep Training fast
+        if self.rad_trig.isChecked():
+            decision, ocr_conf, ocr_res = self._ocr__decide_go_nogo(self._last_frame_bgr)
+            self._save_ocr_snapshot(self._last_frame_bgr, ocr_res, tag="training")
+            self._draw_ocr(vis, ocr_res)
+        else:
+            decision, ocr_conf, ocr_res = ("nogo", 0.0, {"detections": [], "infer_ms": 0.0})
+
+        self._set_overlay(vis, ttl_sec=5.0)
+
+        # table + summary
+        self._update_ocr_summary(decision, ocr_conf, ocr_res)
+        self._populate_table(dets)
+
+        # publish policy
         if self.rad_trig.isChecked() and self._expect_one_result:
-            self._publish_vgr_result(dets)
+            self._publish_vgr_result(dets, forced_name=decision, ocr_score=ocr_conf)
             self._expect_one_result = False
             self._last_result_time = time.time()
 
-        # In Training mode, publish if desired every run
         if self.rad_train.isChecked() and publish:
-            name, ocr_conf, _ = self._ocr__decide_go_nogo(self._last_frame_bgr)
-            self._publish_vgr_result(dets, forced_name=name, ocr_score=ocr_conf)
-
+            # still publish geometry for debugging; name/score reflect the (skipped) OCR
+            self._publish_vgr_result(dets, forced_name=decision, ocr_score=ocr_conf)
 
     def _canny_edges(self, gray: np.ndarray) -> np.ndarray:
         # optional CLAHE
@@ -1195,7 +1268,30 @@ class MainWindow(QtWidgets.QMainWindow):
             if not drop:
                 kept.append(d)
         return kept
-    
+    def _draw_ocr(self, vis: np.ndarray, ocr_res: dict):
+        """Overlay OCR polygons + text onto vis."""
+        if not isinstance(ocr_res, dict): 
+            return
+        for det in ocr_res.get("detections", []):
+            poly = np.array(det.get("bbox", []), dtype=np.int32).reshape(-1, 2)
+            if poly.shape[0] >= 4:
+                cv2.polylines(vis, [poly], True, (255, 0, 0), 2, cv2.LINE_AA)
+                label = f"{det.get('text','')} ({float(det.get('confidence',0.0)):.2f})"
+                x, y = int(poly[0,0]), int(poly[0,1])
+                cv2.putText(vis, label, (x, max(12, y - 6)), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+
+    def _set_overlay(self, bgr: np.ndarray, ttl_sec: float = 5.0, jpeg_q: int = 80):
+        """Show bgr on screen and hold it as overlay for ttl_sec seconds."""
+        try:
+            jpeg = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_q)])[1].tobytes()
+            qi = QtGui.QImage.fromData(jpeg, "JPG")
+            self._last_overlay = qi
+            self._overlay_until = time.time() + float(ttl_sec)
+            self._set_pixmap(qi)
+        except Exception:
+            pass
+
     def _compute_contours(self, bgr: np.ndarray, offset: Tuple[int,int]=(0,0)) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         """
         Return (overlay_bgr, detections list).
@@ -1245,54 +1341,45 @@ class MainWindow(QtWidgets.QMainWindow):
             perim_outer = float(cv2.arcLength(c, True))
             perim_holes = float(sum(cv2.arcLength(hh, True) for hh in holes))
             perim_total = perim_outer + perim_holes
-
-            x, y, w, h = cv2.boundingRect(c)
-            if REJECT_BORDER_TOUCHING and (x <= 0 or y <= 0 or x + w >= ew-1 or y + h >= eh-1):
-                continue
-
-            ar = w / max(1, h)
-            hull = cv2.convexHull(c)
-            hull_area = float(cv2.contourArea(hull))
-            solidity = area / max(1.0, hull_area)
-
-            # --- apply UI filters ---
-            if area < int(self.sp_min_area.value()):
-                continue
-            ma = int(self.sp_max_area.value())
-            if ma > 0 and area > ma:
-                continue
-            if perim_total < float(self.ds_perim_min.value()):
-                continue
-            if not (float(self.ds_aspect_min.value()) <= ar <= float(self.ds_aspect_max.value())):
-                continue
-            if solidity < float(self.ds_solidity_min.value()):
-                continue
-
+            
+            # Oriented bounding box (rotated)
             rect = cv2.minAreaRect(c)
-            box = np.int32(np.round(cv2.boxPoints(rect)))
-            ((_, _), (RW, RH), Rangle) = rect
-            theta_deg = float(Rangle + 90.0) if RW > RH else float(Rangle)
+            box  = cv2.boxPoints(rect).astype(np.float32)
+            ((cx, cy), (w, h), angle) = rect
 
-            # shift for ROI offset
-            c_shift = (c + np.array([[[ox, oy]]], dtype=c.dtype))
-            holes_shift = [(hh + np.array([[[ox, oy]]], dtype=hh.dtype)) for hh in holes]
-            box[:, 0] += ox; box[:, 1] += oy
+            # Apply ROI → full-frame offset (so teaching overlays line up)
+            if ox != 0 or oy != 0:
+                c       = (c.astype(np.float32) + np.array([[[ox, oy]]], dtype=np.float32)).astype(np.int32)
+                holes   = [(hh.astype(np.float32) + np.array([[[ox, oy]]], dtype=np.float32)).astype(np.int32) for hh in holes]
+                box[:, 0] += ox
+                box[:, 1] += oy
+                cx += ox; cy += oy
 
+            # Compute other properties
+            area = float(cv2.contourArea(c))
+            perim = float(cv2.arcLength(c, True))
+            hull = cv2.convexHull(c)
+            solidity = area / max(1.0, float(cv2.contourArea(hull)))
+
+            theta_deg = float(angle)
+            if w < h:
+                theta_deg = theta_deg + 90.0
+
+            # Store detection
             dets.append({
                 "area": area,
-                "perim": perim_total,
-                "bbox": (x + ox, y + oy, w, h),
-                "solidity": solidity,
-                "contour": c_shift,
-                "holes": holes_shift,
-                "quad": box.tolist(),
-                "center": [int(x + w/2 + ox), int(y + h/2 + oy)],
+                "perim": perim,
+                "bbox": cv2.boundingRect(box.astype(np.int32)),   # integer axis box from rotated corners (with offset)
+                "quad": box.astype(np.int32).tolist(),            # oriented corners (with offset)
+                "center": [float(cx), float(cy)],
                 "theta_deg": theta_deg,
-                "size_wh": [int(w), int(h)],
-                "holes_count": len(holes),
-                "holes_area": holes_area,
-                "match": None,
+                "solidity": solidity,
+                "contour": c,                                     # ← contour already offset
+                "holes": holes,                                   # ← holes already offset
             })
+
+                        
+
 
         # --- compute match scores (lower is better) before suppression ---
         tpl_selected = (0 <= self._active_index < len(self._templates))
@@ -1359,7 +1446,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 color = (0,255,0)
                 if d.get("match") is not None and np.isfinite(d["match"]):
                     color = (0,128,255)
-                cv2.rectangle(vis, (x,y), (x+w,y+h), color, 2)
+                box = np.int32(d["quad"])
+                cv2.polylines(vis, [box], True, color, 2)
+                # --- draw orientation label ---
+                cx, cy = map(int, d["center"])
+                ang = float(d.get("theta_deg", 0.0))
+                cv2.putText(vis, f"{ang:.1f}°", (cx + 10, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
             if self.chk_draw_cent.isChecked():
                 cx, cy = x + w//2, y + h//2
                 cv2.circle(vis, (cx,cy), 4, (255,0,0), -1)
@@ -1382,21 +1476,20 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _publish_vgr_result(self, dets: List[Dict[str, Any]], forced_name: Optional[str] = None, ocr_score: Optional[float] = None):
         """
-        Same payload as before. 'name' is forced by OCR ("go"/"nogo").
-        If no contours, we send an empty result like before.
+        Publishes a single object. 'score' is ALWAYS the OCR confidence.
         """
         if not self.chk_pub_robot.isChecked():
             return
 
-        # choose a geometry carrier (largest-area contour or first)
         best_det = dets[0] if dets else None
 
+        # If nothing detected, still publish an empty result so downstream is deterministic
         if best_det is None:
             payload = {
-                "version":"1.0",
-                "sdk":"vision_ui",
+                "version": "1.0",
+                "sdk": "vision_ui",
                 "session": self.session_id,
-                "timestamp_ms": int(time.time()*1000),
+                "timestamp_ms": int(time.time() * 1000),
                 "camera": {"proc_width": int(self.last_frame_wh[0]), "proc_height": int(self.last_frame_wh[1])},
                 "result": {"objects": [], "counts": {"objects": 0, "detections": 0}}
             }
@@ -1404,23 +1497,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("VGR ← empty (no detections)")
             return
 
-        # geometry from contour (unchanged)
         x, y, w, h = best_det["bbox"]
-        cx, cy = best_det.get("center", [int(x + w/2), int(y + h/2)])
+        cx, cy = best_det.get("center", [x + w / 2.0, y + h / 2.0])
         quad = best_det.get("quad")
-        inst_id = 0
-        inliers = int(len(best_det.get("contour", [])))
         theta = float(best_det.get("theta_deg", 0.0))
         size_wh = best_det.get("size_wh", [int(w), int(h)])
 
-        # name is forced by OCR; fallback to "nogo" if missing
-        send_name = forced_name if forced_name in ("go","nogo") else "nogo"
-        score = float(ocr_score if (ocr_score is not None) else 1.0)  # keep positive
+        send_name = forced_name if forced_name in ("go", "nogo") else "nogo"
+
+        score = float(ocr_score if (ocr_score is not None) else 0.0)
+
+        _m = best_det.get("match", None)
+        if isinstance(_m, (int, float)) and np.isfinite(_m):
+            match_score = float(_m)
+        else:
+            match_score = None
 
         det_obj = {
-            "instance_id": inst_id,
-            "score": float(score),
-            "inliers": inliers,
+            "instance_id": 0,
+            "score": score,                 # ← OCR confidence only
+            "inliers": int(len(best_det.get("contour", []))),
             "pose": {
                 "x": float(cx), "y": float(cy), "theta_deg": float(theta),
                 "x_scale": 1.0, "y_scale": 1.0,
@@ -1428,26 +1524,27 @@ class MainWindow(QtWidgets.QMainWindow):
             },
             "center": [float(cx), float(cy)],
             "quad": quad if quad else None,
+            "match": match_score            # ← auxiliary (does not affect downstream decisions)
         }
 
         obj = {
             "object_id": 1,
-            "name": send_name,                  # ← only change that matters downstream
+            "name": send_name,
             "template_size": [int(size_wh[0]), int(size_wh[1])],
             "detections": [det_obj]
         }
 
         payload = {
-            "version":"1.0",
-            "sdk":"vision_ui",
+            "version": "1.0",
+            "sdk": "vision_ui",
             "session": self.session_id,
-            "timestamp_ms": int(time.time()*1000),
+            "timestamp_ms": int(time.time() * 1000),
             "camera": {"proc_width": int(self.last_frame_wh[0]), "proc_height": int(self.last_frame_wh[1])},
             "result": {"objects": [obj], "counts": {"objects": 1, "detections": 1}}
         }
 
         self.pub_vgr.send_json(payload)
-        self._append_log(f"VGR ← {send_name}  ocr_conf={score:.2f} px=({cx:.1f},{cy:.1f}) yaw={theta:.2f}° size={size_wh}")
+        self._append_log(f"VGR ← {send_name}  ocr_conf={score:.2f} px=({cx:.1f},{cy:.1f}) yaw={theta:.2f}° size={size_wh} match={match_score}")
 
     # ───────────────────────── settings ─────────────────────────
 
